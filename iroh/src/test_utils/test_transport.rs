@@ -466,6 +466,18 @@ mod tests {
             .is_some_and(|p| p.is_relay())
     }
 
+    /// ember: waits until `settled` holds of `conn`'s paths, as they are chosen after the handshake. Not a deadline:
+    /// a test asserts it afterwards, and 30 s only keeps a broken run from hanging. A fixed wait of 100-200 ms lost
+    /// to a busy CI machine.
+    async fn settle(conn: &crate::endpoint::Connection, settled: fn(&crate::endpoint::Connection) -> bool) {
+        let _ = tokio::time::timeout(Duration::from_secs(30), async {
+            while !settled(conn) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
     /// Verifies echo works over the connection.
     async fn verify_echo(conn: &crate::endpoint::Connection, msg: &[u8]) -> Result<()> {
         let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
@@ -576,8 +588,7 @@ mod tests {
             .connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN)
             .await?;
 
-        // Wait for paths to settle
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        settle(&conn, is_custom_selected).await;
 
         assert!(
             is_custom_selected(&conn),
@@ -615,8 +626,7 @@ mod tests {
             .connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN)
             .await?;
 
-        // Wait for paths to settle
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        settle(&conn, is_ip_selected_from_ip_and_custom).await;
 
         assert!(
             is_ip_selected_from_ip_and_custom(&conn),
@@ -696,8 +706,7 @@ mod tests {
 
             let conn = ep1.connect(relay_only_addr, ECHO_ALPN).await?;
 
-            // Wait for relay path to be established
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            settle(&conn, is_relay_selected).await;
 
             // Debug: print paths after relay-only connect
             let paths = conn.paths();
@@ -725,8 +734,7 @@ mod tests {
         // Now connect with all addresses (relay + custom)
         let conn = ep1.connect(all_addrs, ECHO_ALPN).await?;
 
-        // Wait for paths to settle
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        settle(&conn, is_custom_selected).await;
 
         // Debug: print all paths
         let paths = conn.paths();
