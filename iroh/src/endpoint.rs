@@ -856,6 +856,13 @@ impl Builder {
         self
     }
 
+    /// ember: chooses among direct paths and the relay by RTT, and a custom transport only while none of them has
+    /// been measured, however fast it is. By default a custom transport ranks with them by its RTT.
+    pub fn custom_transports_last(mut self) -> Self {
+        self.path_selector = Arc::new(BiasedRttPathSelector::custom_transports_last());
+        self
+    }
+
     /// Sets a custom [`PathSelector`] for this endpoint.
     ///
     /// The path selector decides which path to use among the candidate paths to a

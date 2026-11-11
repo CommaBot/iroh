@@ -752,9 +752,12 @@ mod tests {
         Ok(())
     }
 
-    /// ember: a relay's front door, a TCP proxy the test slows: what goes through it waits `delay` ms either way.
+    /// ember: a relay's front door, a TCP proxy the test slows and shuts: what goes through it waits `delay` ms
+    /// either way; shut, it drops what runs through it and takes nothing new.
     struct RelayDoor {
         url: crate::RelayUrl,
+        open: Arc<std::sync::atomic::AtomicBool>,
+        running: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     }
 
     impl RelayDoor {
@@ -764,8 +767,14 @@ mod tests {
             let port = listener.local_addr().anyerr()?.port();
             let host = relay.host_str().expect("host").to_string();
             let target = format!("{host}:{}", relay.port().expect("port"));
+            let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let running: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
+            let (accepting, tasks) = (open.clone(), running.clone());
             tokio::spawn(async move {
                 while let Ok((inbound, _)) = listener.accept().await {
+                    if !accepting.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
                     let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
                         continue;
                     };
@@ -782,7 +791,8 @@ mod tests {
                         // A delay line: each read goes on `delay` after it came, in order.
                         let (tx, mut rx) =
                             tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
-                        tokio::spawn(async move {
+                        let mut held = tasks.lock().unwrap();
+                        held.push(tokio::spawn(async move {
                             let mut buf = vec![0u8; 64 * 1024];
                             while let Ok(n) = from.read(&mut buf).await {
                                 if n == 0
@@ -791,21 +801,34 @@ mod tests {
                                     break;
                                 }
                             }
-                        });
-                        tokio::spawn(async move {
+                        }));
+                        held.push(tokio::spawn(async move {
                             while let Some((at, bytes)) = rx.recv().await {
                                 tokio::time::sleep_until(at).await;
                                 if to.write_all(&bytes).await.is_err() {
                                     break;
                                 }
                             }
-                        });
+                        }));
                     }
                 }
             });
             Ok(Self {
                 url: format!("https://{host}:{port}").parse().expect("url"),
+                open,
+                running,
             })
+        }
+
+        fn shut(&self) {
+            self.open.store(false, std::sync::atomic::Ordering::SeqCst);
+            for task in self.running.lock().unwrap().drain(..) {
+                task.abort();
+            }
+        }
+
+        fn reopen(&self) {
+            self.open.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -814,6 +837,7 @@ mod tests {
     async fn relay_and_custom(
         network: &TestNetwork,
         door: &RelayDoor,
+        custom_last: bool,
     ) -> Result<(Endpoint, Endpoint, EndpointAddr, tokio::task::JoinHandle<()>)> {
         const ALPN: &[u8] = b"ember/test/route";
         let bind = |secret: SecretKey| {
@@ -827,6 +851,7 @@ mod tests {
                     .add_custom_transport(transport.anyerr()?)
                     .clear_ip_transports()
                     .alpns(vec![ALPN.to_vec()]);
+                let builder = if custom_last { builder.custom_transports_last() } else { builder };
                 builder.bind().await.anyerr()
             }
         };
@@ -877,6 +902,31 @@ mod tests {
         .anyerr()
     }
 
+    /// ember: `custom_transports_last` carries a connection on the relay though the custom transport is faster; the
+    /// relay lost, on the custom transport.
+    #[tokio::test]
+    async fn custom_transports_last_prefers_the_relay_and_falls_back() -> Result<()> {
+        let (_map, relay_url, _relay_server) = run_relay_server().await?;
+        let door = RelayDoor::to(&relay_url, Duration::from_millis(20)).await?;
+        let network = TestNetwork::new();
+        let (server, client, addr, accepting) = relay_and_custom(&network, &door, true).await?;
+        let conn = client.connect(addr, b"ember/test/route").await.anyerr()?;
+
+        until_selected(&conn, |a| matches!(a, TransportAddr::Relay(_))).await?;
+        verify_echo(&conn, b"through the relay").await?;
+
+        door.shut();
+        until_selected(&conn, |a| matches!(a, TransportAddr::Custom(_))).await?;
+        verify_echo(&conn, b"through the custom transport").await?;
+        door.reopen();
+
+        conn.close(0u32.into(), b"done");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
     /// ember: a new connection's handshake goes on every path while an older connection to the same peer has one
     /// selected. That path dead without a word (the peer's process restarted on another port), the older connection
     /// keeps it selected until it gives it up; the new one is made through the relay meanwhile.
@@ -886,7 +936,7 @@ mod tests {
         // The relay slower than the custom transport, which is selected then.
         let door = RelayDoor::to(&relay_url, Duration::from_millis(20)).await?;
         let network = TestNetwork::new();
-        let (server, client, addr, accepting) = relay_and_custom(&network, &door).await?;
+        let (server, client, addr, accepting) = relay_and_custom(&network, &door, false).await?;
         let old = client.connect(addr.clone(), b"ember/test/route").await.anyerr()?;
         until_selected(&old, |a| matches!(a, TransportAddr::Custom(_))).await?;
 
