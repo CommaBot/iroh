@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: iroh's tests
-        run: cargo test -p iroh --lib --features test-utils
+        run: cargo test -p iroh --lib --features test-utils,unstable-custom-transports
       - name: a relay gone slow is left (a binary of its own)
         run: cargo test -p iroh --features test-utils --test relay_slow
       - name: iroh-relay's tests

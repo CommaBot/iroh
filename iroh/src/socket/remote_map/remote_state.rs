@@ -870,64 +870,55 @@ impl State {
         // though we might not have a relay transport or ip-capable transport set up.
         // So these errors must not be fatal for this actor (or even this operation).
 
-        // Initial packets belong to a new connection, while selected_path belongs to the peer.
-        // With every relay available, race them again: an older connection's selection may have
-        // become slow before its next RTT sample or path reselection. Established packets use
-        // their concrete path in TransportsSender and do not enter this branch.
-        let targets = if let Some(addr) = self.selected_path.as_ref().filter(|_| !self.several_relays) {
-            trace!(?addr, "sending datagram to selected path");
+        // Initial packets belong to a new connection, while selected_path belongs to the peer: race them on every
+        // known path even while a path is selected. An older connection's selection may have become slow before its
+        // next RTT sample or path reselection, or dead: a peer whose process restarted on another port is reached
+        // through the relay at once, but its old direct path stays selected until the old connection times out (28 s
+        // measured). Established packets use their concrete path in TransportsSender and do not come here.
+        trace!(
+            paths = ?self.paths.addrs().collect::<Vec<_>>(),
+            "sending datagram to all known paths",
+        );
+        // ember: kept for addresses found later (see `unanswered`).
+        if self.selected_path.is_none() {
+            match &mut self.unanswered {
+                Some((kept_sender, kept)) => {
+                    *kept_sender = sender.clone();
+                    if kept.len() == UNANSWERED_KEPT {
+                        kept.remove(0);
+                    }
+                    kept.push(transmit.clone());
+                }
+                None => self.unanswered = Some((sender.clone(), vec![transmit.clone()])),
+            }
+        }
+        if self.paths.is_empty() {
+            warn!("Cannot send datagrams: No paths to remote endpoint known");
+        }
+
+        let mut targets = Vec::new();
+        for addr in self.paths.addrs() {
+            // We never want to send to our local addresses.
+            // The local address set is updated in the main loop so we can use `peek` here.
+            if let transports::Addr::Ip(sockaddr) = addr
+                && self
+                    .local_direct_addrs
+                    .peek()
+                    .iter()
+                    .any(|a| a.addr == *sockaddr)
+            {
+                trace!(%sockaddr, "not sending datagram to our own address");
 
             // TODO(Frando): We might want to include a local IP here in the future, if we confidently
             // know that it is the correct one.
             // See https://github.com/n0-computer/iroh/issues/4280.
-            vec![transports::FourTuple::from_remote(addr.remote())]
-        } else {
-            trace!(
-                paths = ?self.paths.addrs().collect::<Vec<_>>(),
-                "sending datagram to all known paths",
-            );
-            // ember: kept for addresses found later (see `unanswered`).
-            if self.selected_path.is_none() {
-                match &mut self.unanswered {
-                    Some((kept_sender, kept)) => {
-                        *kept_sender = sender.clone();
-                        if kept.len() == UNANSWERED_KEPT {
-                            kept.remove(0);
-                        }
-                        kept.push(transmit.clone());
-                    }
-                    None => self.unanswered = Some((sender.clone(), vec![transmit.clone()])),
-                }
+            } else {
+                targets.push(transports::FourTuple::from_remote(addr.clone()));
             }
-            if self.paths.is_empty() {
-                warn!("Cannot send datagrams: No paths to remote endpoint known");
-            }
-
-            let mut targets = Vec::new();
-            for addr in self.paths.addrs() {
-                // We never want to send to our local addresses.
-                // The local address set is updated in the main loop so we can use `peek` here.
-                if let transports::Addr::Ip(sockaddr) = addr
-                    && self
-                        .local_direct_addrs
-                        .peek()
-                        .iter()
-                        .any(|a| a.addr == *sockaddr)
-                {
-                    trace!(%sockaddr, "not sending datagram to our own address");
-
-                // TODO(Frando): We might want to include a local IP here in the future, if we confidently
-                // know that it is the correct one.
-                // See https://github.com/n0-computer/iroh/issues/4280.
-                } else {
-                    targets.push(transports::FourTuple::from_remote(addr.clone()));
-                }
-            }
-            // This message is received *before* a connection is added.  So we do
-            // not yet have a connection to holepunch.  Instead we trigger
-            // holepunching when AddConnection is received.
-            targets
-        };
+        }
+        // This message is received *before* a connection is added.  So we do
+        // not yet have a connection to holepunch.  Instead we trigger
+        // holepunching when AddConnection is received.
         queue_datagram(send_tasks, sender, transmit, targets);
     }
 
