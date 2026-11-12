@@ -86,6 +86,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Recheck alternate entrances to one relay without registering the endpoint's key on it twice.
 const ENTRY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// ember: the longest a datagram waits to be written to the relay server before it is dropped instead.
+///
+/// A datagram is QUIC's, which sends again what it does not hear acknowledged: one written seconds late is no use to
+/// it, and does harm. Queued behind a relay connection that writes slowly or not at all (its TCP stalled, or filled by
+/// what went before), an Initial written tens of seconds late made a handshake whose first RTT sample was that wait,
+/// and whose lost packets were not sent again for minutes (2026-11-12: Initials queued 0.5–125 s on a device's
+/// relay connections, a connection made on one that came up with a 37.8 s round trip and carried nothing). The relay
+/// server drops what waits in a client's queue the same way (iroh-relay `MAX_PACKET_WAIT`).
+pub(crate) const MAX_SEND_WAIT: Duration = Duration::from_secs(1);
+
+/// ember: how long a relay connection may take nothing of what is written to it before it is taken for stalled,
+/// closed and dialled again. A batch of datagrams waited up to `PING_INTERVAL` before, the connection meanwhile held
+/// by every endpoint that went through it; counted from the last datagram the connection took, a slow one that still
+/// moves is not stalled.
+pub(crate) const SEND_STALL: Duration = Duration::from_secs(3);
+
 /// Time after which the [`ActiveRelayActor`] will drop undeliverable datagrams.
 ///
 /// When the [`ActiveRelayActor`] is not connected it can not deliver datagrams.  However it
@@ -891,16 +907,17 @@ impl ActiveRelayActor {
                     self.reset_inactive_timeout();
                     // TODO(frando): can we avoid the clone here?
                     let metrics = self.metrics.clone();
-                    let packet_iter = send_datagrams_buf.drain(..).map(|item| {
-                        metrics.send_relay.inc_by(item.datagrams.contents.len() as _);
-                        Ok(ClientToRelayMsg::Datagrams {
-                            dst_endpoint_id: item.remote_endpoint,
-                            datagrams: item.datagrams,
-                        })
+                    // ember: each datagram looked at as the connection takes the one before it: one that waited
+                    // longer than MAX_SEND_WAIT is dropped, and the connection taking one is its progress.
+                    let progress = Progress::default();
+                    let taken = progress.clone();
+                    let packet_iter = send_datagrams_buf.drain(..).filter_map(move |item| {
+                        taken.now();
+                        fresh(item, &metrics).map(Ok)
                     });
                     let mut packet_stream = n0_future::stream::iter(packet_iter);
                     let fut = client_sink.send_all(&mut packet_stream);
-                    self.run_sending(fut, &mut state, &mut client_stream).await?;
+                    self.run_sending_progress(fut, &mut state, &mut client_stream, Some(&progress)).await?;
                 }
                 msg = client_stream.next() => {
                     let Some(msg) = msg else {
@@ -1003,17 +1020,26 @@ impl ActiveRelayActor {
     /// On `Err` the relay connection should be disconnected.  An `Ok` return means either
     /// the actor should shut down, consult the [`ActiveRelayActor::stop_token`] and
     /// [`ActiveRelayActor::inactive_timeout`] for this, or the send was successful.
-    #[instrument(name = "tx", skip_all)]
     async fn run_sending<T>(
         &mut self,
         sending_fut: impl Future<Output = Result<T, RunError>>,
         state: &mut ConnectedRelayState,
         client_stream: &mut iroh_relay::client::ClientStream,
     ) -> Result<(), RelayConnectionError> {
-        // we use the same time as for our ping interval
-        let send_timeout = PING_INTERVAL;
+        self.run_sending_progress(sending_fut, state, client_stream, None).await
+    }
 
-        let mut timeout = pin!(time::sleep(send_timeout));
+    /// As [`Self::run_sending`]; the connection is taken for stalled once it took nothing for `SEND_STALL`:
+    /// counted from the last of `progress` (what the sending took of the connection), from the start without.
+    #[instrument(name = "tx", skip_all)]
+    async fn run_sending_progress<T>(
+        &mut self,
+        sending_fut: impl Future<Output = Result<T, RunError>>,
+        state: &mut ConnectedRelayState,
+        client_stream: &mut iroh_relay::client::ClientStream,
+        progress: Option<&Progress>,
+    ) -> Result<(), RelayConnectionError> {
+        let mut timeout = pin!(stalled(progress, Instant::now()));
         let mut sending_fut = pin!(sending_fut);
         let res = loop {
             tokio::select! {
@@ -1062,6 +1088,46 @@ impl ActiveRelayActor {
             }
         };
         res.map_err(|err| state.map_err(err))
+    }
+}
+
+/// ember: what is written of a datagram to the relay server: nothing once it waited longer than `MAX_SEND_WAIT`.
+fn fresh(item: RelaySendItem, metrics: &SocketMetrics) -> Option<ClientToRelayMsg> {
+    let len = item.datagrams.contents.len() as u64;
+    if item.queued_at.elapsed() > MAX_SEND_WAIT {
+        metrics.send_relay_stale.inc_by(len);
+        return None;
+    }
+    metrics.send_relay.inc_by(len);
+    Some(ClientToRelayMsg::Datagrams {
+        dst_endpoint_id: item.remote_endpoint,
+        datagrams: item.datagrams,
+    })
+}
+
+/// ember: resolves once the connection took nothing for `SEND_STALL`: since the last of `progress`, or since
+/// `started` while there is none.
+async fn stalled(progress: Option<&Progress>, started: Instant) {
+    loop {
+        let due = progress.and_then(Progress::last).unwrap_or(started) + SEND_STALL;
+        if due <= Instant::now() {
+            return;
+        }
+        time::sleep_until(due).await;
+    }
+}
+
+/// ember: when a relay connection last took something written to it (`run_sending_progress`).
+#[derive(Debug, Clone, Default)]
+struct Progress(Arc<std::sync::Mutex<Option<Instant>>>);
+
+impl Progress {
+    fn now(&self) {
+        *self.0.lock().expect("poisoned") = Some(Instant::now());
+    }
+
+    fn last(&self) -> Option<Instant> {
+        *self.0.lock().expect("poisoned")
     }
 }
 
@@ -1123,6 +1189,8 @@ pub(crate) struct RelaySendItem {
     pub(crate) url: RelayUrl,
     /// One or more datagrams to send.
     pub(crate) datagrams: Datagrams,
+    /// ember: when it was handed to the relay transport, for `MAX_SEND_WAIT`.
+    pub(crate) queued_at: Instant,
 }
 
 pub(super) struct RelayActor {
@@ -1750,6 +1818,7 @@ mod tests {
     };
 
     use iroh_base::{EndpointId, RelayUrl, SecretKey};
+    use n0_future::time::Instant;
     use iroh_relay::{
         PingTracker,
         protos::relay::Datagrams,
@@ -1842,6 +1911,7 @@ mod tests {
                         } = recv;
                         info!(from = %src.fmt_short(), "Received datagram");
                         let send = RelaySendItem {
+                            queued_at: Instant::now(),
                             remote_endpoint: src,
                             url: relay_url.clone(),
                             datagrams,
@@ -2014,6 +2084,7 @@ mod tests {
         };
         let _actor = AbortOnDropHandle::new(tokio::spawn(ActiveRelayActor::new(opts).run()));
         let packet = RelaySendItem {
+            queued_at: Instant::now(),
             remote_endpoint: peer,
             url: relay.clone(),
             datagrams: Datagrams::from(b"still connected"),
@@ -2085,6 +2156,7 @@ mod tests {
         // Send a datagram to our echo endpoint.
         info!("first echo");
         let hello_send_item = RelaySendItem {
+            queued_at: Instant::now(),
             remote_endpoint: peer_endpoint,
             url: relay_url.clone(),
             datagrams: Datagrams::from(b"hello"),
@@ -2300,5 +2372,50 @@ mod tests {
             watch.get(),
             Some(RelayStatus::new(b, RelayConnectionState::Connected)),
         );
+    }
+
+    /// ember: a datagram that waited longer than `MAX_SEND_WAIT` to be written is dropped, and counted; one that did
+    /// not wait that long is written. On the test's clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_datagram_that_waited_too_long_is_not_written() {
+        let metrics = crate::socket::Metrics::default();
+        let item = || RelaySendItem {
+            queued_at: Instant::now(),
+            remote_endpoint: SecretKey::from_bytes(&[1u8; 32]).public(),
+            url: "https://relay.example.com".parse().unwrap(),
+            datagrams: Datagrams::from(b"hello"),
+        };
+        let old = item();
+        tokio::time::advance(super::MAX_SEND_WAIT + Duration::from_millis(1)).await;
+        assert!(super::fresh(old, &metrics).is_none(), "a datagram queued past MAX_SEND_WAIT was written");
+        assert!(super::fresh(item(), &metrics).is_some());
+        assert_eq!(metrics.send_relay_stale.get(), 5);
+        assert_eq!(metrics.send_relay.get(), 5);
+    }
+
+    /// ember: a relay connection is taken for stalled once it took nothing for `SEND_STALL`, counted from what it
+    /// took last; one that keeps taking is not, however long the sending lasts. On the test's clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_takes_nothing_is_stalled() {
+        let started = Instant::now();
+        let progress = super::Progress::default();
+        let mut stalled = std::pin::pin!(super::stalled(Some(&progress), started));
+        // Taking something every second: never stalled, for longer than SEND_STALL.
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            progress.now();
+            assert!(n0_future::future::poll_once(&mut stalled).await.is_none(), "stalled while it took something");
+        }
+        // Then nothing: stalled SEND_STALL after the last.
+        let last = Instant::now();
+        let at = {
+            stalled.await;
+            Instant::now()
+        };
+        assert_eq!(at - last, super::SEND_STALL);
+        // Nothing taken at all: stalled SEND_STALL after the start.
+        let started = Instant::now();
+        super::stalled(None, started).await;
+        assert_eq!(Instant::now() - started, super::SEND_STALL);
     }
 }

@@ -16,6 +16,9 @@ pub struct Metrics {
     pub send_ipv6: Counter,
     /// Number of bytes sent over the relay transport.
     pub send_relay: Counter,
+    /// ember: number of bytes not sent over the relay transport because they waited longer than
+    /// `MAX_SEND_WAIT` to be written (`relay::actor`).
+    pub send_relay_stale: Counter,
 
     /// Number of data bytes received over the relay transport.
     pub recv_data_relay: Counter,

@@ -315,6 +315,7 @@ impl RelaySender {
             Ok(()) => {
                 let contents = datagrams_from_transmit(transmit);
                 let item = RelaySendItem {
+                    queued_at: n0_future::time::Instant::now(),
                     remote_endpoint: dest_endpoint,
                     url: dest_url.clone(),
                     datagrams: contents,
