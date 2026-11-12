@@ -77,7 +77,23 @@ pub(crate) struct Conn {
     pub(crate) conn: WsBytesFramed,
     pub(crate) key_cache: KeyCache,
     pub(crate) protocol_version: ProtocolVersion,
+    /// ember: the browser's WebSocket, asked how much it has yet to send (`bufferedAmount`): a browser buffers all that
+    /// is sent on a WebSocket, so what waits to be written must wait before it, where it ages out (client/tcp.rs).
+    #[cfg(wasm_browser)]
+    #[debug("ws_stream_wasm::WsMeta")]
+    pub(crate) meta: ws_stream_wasm::WsMeta,
+    /// ember: when to ask `meta` again while it holds too much: the browser tells nothing as it sends.
+    #[cfg(wasm_browser)]
+    #[debug(skip)]
+    pub(crate) recheck: Option<Pin<Box<n0_future::time::Sleep>>>,
 }
+
+/// ember: the most a browser's relay WebSocket holds that it has not sent yet (client/tcp.rs UNSENT_MAX), and how often
+/// it is asked again while it holds more.
+#[cfg(wasm_browser)]
+const UNSENT_MAX: u32 = 16 * 1024;
+#[cfg(wasm_browser)]
+const UNSENT_RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
 
 impl Conn {
     /// Constructs a new websocket connection, including the initial server handshake.
@@ -86,6 +102,7 @@ impl Conn {
             MaybeTlsStream<ProxyStream>,
         >,
         #[cfg(wasm_browser)] io: ws_stream_wasm::WsStream,
+        #[cfg(wasm_browser)] meta: ws_stream_wasm::WsMeta,
         key_cache: KeyCache,
         secret_key: &SecretKey,
         protocol_version: ProtocolVersion,
@@ -101,6 +118,10 @@ impl Conn {
             conn,
             key_cache,
             protocol_version,
+            #[cfg(wasm_browser)]
+            meta,
+            #[cfg(wasm_browser)]
+            recheck: None,
         })
     }
 
@@ -141,6 +162,18 @@ impl Sink<ClientToRelayMsg> for Conn {
     type Error = SendError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        #[cfg(wasm_browser)]
+        loop {
+            if self.meta.buffered_amount() <= UNSENT_MAX {
+                self.recheck = None;
+                break;
+            }
+            let recheck = self
+                .recheck
+                .get_or_insert_with(|| Box::pin(n0_future::time::sleep(UNSENT_RECHECK)));
+            ready!(recheck.as_mut().poll(cx));
+            self.recheck = None;
+        }
         Pin::new(&mut self.conn).poll_ready(cx).map_err(Into::into)
     }
 

@@ -485,6 +485,7 @@ impl ClientBuilder {
 
         let conn = Conn::new(
             ws_stream,
+            ws_meta,
             self.key_cache.clone(),
             &self.secret_key,
             protocol_version,

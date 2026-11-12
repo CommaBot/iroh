@@ -1097,8 +1097,10 @@ impl ActiveRelayActor {
 /// ember: what is written of a datagram to the relay server: nothing once it waited longer than `MAX_SEND_WAIT`.
 fn fresh(item: RelaySendItem, metrics: &SocketMetrics) -> Option<ClientToRelayMsg> {
     let len = item.datagrams.contents.len() as u64;
-    if item.queued_at.elapsed() > MAX_SEND_WAIT {
+    let waited = item.queued_at.elapsed();
+    if waited > MAX_SEND_WAIT {
         metrics.send_relay_stale.inc_by(len);
+        debug!(waited_ms = waited.as_millis() as u64, len, "dropped a datagram that waited too long to be written");
         return None;
     }
     metrics.send_relay.inc_by(len);
