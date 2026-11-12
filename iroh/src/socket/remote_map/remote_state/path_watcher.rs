@@ -132,6 +132,8 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     notify: Notify,
+    /// ember: the connection's tries to open a custom path that left one missing (`RemoteStateActor::open_custom_paths`).
+    custom_tries: std::sync::atomic::AtomicU32,
 }
 
 /// The writer-side handle for a connection's path state.
@@ -157,6 +159,7 @@ impl PathStateSender {
         let shared = Arc::new(Shared {
             state: Default::default(),
             notify: Notify::new(),
+            custom_tries: Default::default(),
         });
         let receiver = PathStateReceiver {
             shared: shared.clone(),
@@ -164,6 +167,13 @@ impl PathStateSender {
         };
         let sender = PathStateSender { shared, events };
         (sender, receiver)
+    }
+
+    /// ember: records the connection's tries to open a custom path (see [`Shared::custom_tries`]).
+    pub(super) fn record_custom_tries(&self, tries: u32) {
+        self.shared
+            .custom_tries
+            .store(tries, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records a newly-opened path and emits [`PathEvent::Opened`].
@@ -312,6 +322,14 @@ impl PathStateReceiver {
             snapshot: self.shared.state.lock().expect("poisoned").clone(),
             conn,
         }
+    }
+
+    /// ember: the connection's tries to open a custom path that left one missing, for tests.
+    #[cfg(test)]
+    pub(crate) fn custom_tries(&self) -> u32 {
+        self.shared
+            .custom_tries
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns a stream of [`PathEvent`]s.

@@ -1145,6 +1145,13 @@ impl Connection<HandshakeCompleted> {
         self.data.paths.get(&self.inner)
     }
 
+    /// ember: how many times this connection tried to open a path to a custom transport address and was left without
+    /// one (each such try took a new path id).
+    #[cfg(test)]
+    pub(crate) fn custom_path_tries(&self) -> u32 {
+        self.data.paths.custom_tries()
+    }
+
     /// Returns a stream of [`PathList`] snapshots for this connection.
     ///
     /// Yields the current snapshot on the first poll, and a fresh

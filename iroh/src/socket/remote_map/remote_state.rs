@@ -68,13 +68,21 @@ const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// ember: how soon a client connection first tries again to open a path to a custom transport address it lacks one
 /// to (`RemoteStateActor::open_custom_paths`); each try that leaves one missing doubles it, up to
 /// [`CUSTOM_PATH_RETRY_MAX`].
+#[cfg(not(test))]
 const CUSTOM_PATH_RETRY: Duration = Duration::from_secs(2);
 /// ember: the longest wait between tries to open a custom path that does not open.
+#[cfg(not(test))]
 const CUSTOM_PATH_RETRY_MAX: Duration = Duration::from_secs(30);
-/// ember: how many times the timer tries again (after 2, 4, 8, 16 and 30 s: about a minute) before it stops until a
-/// custom path opens, a connection is added or the remote's custom addresses change. Each try that fails takes one of
-/// the connection's path ids, which are not given back while it lasts: a custom transport that never answers must not
-/// use up the ids a direct path needs later.
+/// ember: the same waits a twentieth as long in tests, so that a connection's tries are over in about 3 s.
+#[cfg(test)]
+const CUSTOM_PATH_RETRY: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const CUSTOM_PATH_RETRY_MAX: Duration = Duration::from_millis(1500);
+/// ember: how many times a connection tries again after its first try (the timer's: after 2, 4, 8, 16 and 30 s, about a
+/// minute) before it stops until a custom path opens on it or the remote's custom addresses change. A try is counted
+/// whatever asked for it (the timer, an address lookup that found nothing new, another dial): each one that fails takes
+/// one of the connection's path ids, which the remote never gives back for a path it did not see, and a custom transport
+/// that never answers must not use up the ids a direct path needs later.
 const CUSTOM_PATH_TRIES: u32 = 5;
 
 /// ember: how often the path is chosen again from its connections' paths' RTTs. Chosen only as a path opened, was
@@ -209,8 +217,6 @@ struct State {
     /// ember: the wait before the next such try ([`CUSTOM_PATH_RETRY`] doubled after each that left one missing, back
     /// to it when a custom path opens, a connection is added or the remote's custom addresses change).
     custom_retry: Duration,
-    /// ember: the timer's tries since then ([`CUSTOM_PATH_TRIES`] at most).
-    custom_tries: u32,
     /// ember: the remote's custom addresses at the last try.
     known_custom: BTreeSet<transports::Addr>,
 }
@@ -258,7 +264,6 @@ impl RemoteStateActor {
                 relay_reopen_at: None,
                 scheduled_custom_open: None,
                 custom_retry: CUSTOM_PATH_RETRY,
-                custom_tries: 0,
                 known_custom: BTreeSet::new(),
             },
         }
@@ -390,7 +395,6 @@ impl RemoteStateActor {
                 _ = &mut scheduled_custom_open => {
                     self.state.scheduled_custom_open = None;
                     self.state.custom_retry = (self.state.custom_retry * 2).min(CUSTOM_PATH_RETRY_MAX);
-                    self.state.custom_tries += 1;
                     self.open_custom_paths();
                 }
                 _ = &mut relay_reopen => {
@@ -498,6 +502,8 @@ impl RemoteStateActor {
                 path_state: path_state_sender,
                 paths: Default::default(),
                 has_been_direct: false,
+                custom_tries: 0,
+                custom_opening: Vec::new(),
             })
             .into_mut();
 
@@ -537,7 +543,6 @@ impl RemoteStateActor {
     /// ember: the next try to open a custom path comes after [`CUSTOM_PATH_RETRY`] again.
     fn reset_custom_retry(&mut self) {
         self.state.custom_retry = CUSTOM_PATH_RETRY;
-        self.state.custom_tries = 0;
         self.state.scheduled_custom_open = None;
     }
 
@@ -565,32 +570,49 @@ impl RemoteStateActor {
         if known != self.state.known_custom {
             self.state.known_custom = known;
             self.reset_custom_retry();
+            for conn_state in self.connections.values_mut() {
+                conn_state.custom_tries = 0;
+                conn_state.path_state.record_custom_tries(0);
+            }
         }
-        let mut missing = false;
-        for (conn_id, conn_state) in self.connections.iter() {
+        let mut again = false;
+        for (conn_id, conn_state) in self.connections.iter_mut() {
+            // Done trying on this connection until a custom path opens on it or the addresses change.
+            if conn_state.custom_tries > CUSTOM_PATH_TRIES {
+                continue;
+            }
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
             if !conn.side().is_client() {
                 continue;
             }
+            let mut missing = false;
             for addr in &custom {
                 if conn_state.paths.values().any(|open| &open.remote() == addr) {
                     continue;
                 }
                 missing = true;
-                self.state.open_path_on_conn(
+                let opening = self.state.open_path_on_conn(
                     *conn_id,
                     conn_state,
                     &conn,
                     &transports::FourTuple::from_remote(addr.clone()),
                 );
+                // A try is a new path id taken: one already being opened (validating still) is no new try.
+                if let Some(path_id) = opening
+                    && !conn_state.custom_opening.contains(&path_id)
+                {
+                    conn_state.custom_opening.push(path_id);
+                    conn_state.custom_tries += 1;
+                    conn_state.path_state.record_custom_tries(conn_state.custom_tries);
+                }
+            }
+            if missing {
+                again |= conn_state.custom_tries <= CUSTOM_PATH_TRIES;
             }
         }
-        if missing
-            && self.state.scheduled_custom_open.is_none()
-            && self.state.custom_tries < CUSTOM_PATH_TRIES
-        {
+        if again && self.state.scheduled_custom_open.is_none() {
             self.state.scheduled_custom_open = Some(Instant::now() + self.state.custom_retry);
         }
     }
@@ -741,13 +763,16 @@ impl RemoteStateActor {
                     .state
                     .register_and_configure_path(conn_id, conn_state, &path);
                 // ember: a custom path that opens: a later one missing is tried for soon again.
+                conn_state.custom_opening.retain(|id| *id != path_id);
                 if opened.is_some_and(|open| matches!(open.remote(), transports::Addr::Custom(_))) {
                     self.state.custom_retry = CUSTOM_PATH_RETRY;
-                    self.state.custom_tries = 0;
+                    conn_state.custom_tries = 0;
+                    conn_state.path_state.record_custom_tries(0);
                 }
                 self.select_path();
             }
             NoqPathEvent::Abandoned { id, reason, .. } => {
+                conn_state.custom_opening.retain(|opening| *opening != id);
                 // Remove abandoned path from the conn state.
                 let Some(network_path) = conn_state.remove_path(&id, &conn) else {
                     debug!(%id, "path not in path_id_map");
@@ -1253,15 +1278,15 @@ impl State {
         conn_state: &ConnectionState,
         conn: &noq::Connection,
         open_addr: &transports::FourTuple,
-    ) {
+    ) -> Option<PathId> {
         // Only the client opens paths; the server receives them via
         // QUIC frames and reacts to PathOpened events.
         if conn.side().is_server() {
-            return;
+            return None;
         }
         // Already open on this connection; nothing to do.
         if conn_state.paths.values().any(|a| a == open_addr) {
-            return;
+            return None;
         }
 
         let quic_addr =
@@ -1272,14 +1297,13 @@ impl State {
         match fut.path_id() {
             Some(path_id) => {
                 trace!(%conn_id, %path_id, ?path_status, "opening new path");
+                return Some(path_id);
             }
             None => {
                 let ret = now_or_never(fut);
                 match ret {
                     Some(Err(PathError::RemoteCidsExhausted))
                     | Some(Err(PathError::MaxPathIdReached)) => {
-                        self.scheduled_open_path =
-                            Some(Instant::now() + Duration::from_millis(333));
                         // ember: once. A retry tries the address on every connection to the remote, and each one still
                         // out of path ids queued it again: with two or more connections at the limit the queue grew
                         // that many times over every 333 ms, to gigabytes (24 GB in one allocation upstream), the
@@ -1287,10 +1311,12 @@ impl State {
                         // ember: a custom address is not queued at all: its own timer tries it again
                         // (`open_custom_paths`), and queued it would be retried every 333 ms for as long as the
                         // connection has no path id to spare.
-                        if !matches!(open_addr, transports::FourTuple::Custom { .. })
-                            && !self.pending_open_paths.contains(open_addr)
-                        {
-                            self.pending_open_paths.push_back(open_addr.clone());
+                        if !matches!(open_addr, transports::FourTuple::Custom { .. }) {
+                            self.scheduled_open_path =
+                                Some(Instant::now() + Duration::from_millis(333));
+                            if !self.pending_open_paths.contains(open_addr) {
+                                self.pending_open_paths.push_back(open_addr.clone());
+                            }
                         }
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
@@ -1298,6 +1324,7 @@ impl State {
                 }
             }
         }
+        None
     }
 
     /// Returns the [`PathStatus`] for `addr`.
@@ -1604,6 +1631,11 @@ struct ConnectionState {
     ///
     /// Used for recording metrics.
     has_been_direct: bool,
+    /// ember: the tries to open a custom path on this connection, each a new path id, since a custom path last opened
+    /// on it or the remote's custom addresses changed (`RemoteStateActor::open_custom_paths`).
+    custom_tries: u32,
+    /// ember: the custom paths being opened (not yet established or abandoned).
+    custom_opening: Vec<PathId>,
 }
 
 impl ConnectionState {
