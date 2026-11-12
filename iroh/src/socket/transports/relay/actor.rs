@@ -620,7 +620,10 @@ impl ActiveRelayActor {
         // is not an ideal mechanism, an alternative approach would be to use
         // e.g. ConcurrentQueue with force_push, though now you might still send very stale
         // packets when eventually connected.  So perhaps this is a reasonable compromise.
-        let mut send_datagram_flush = time::interval(UNDELIVERABLE_DATAGRAM_TIMEOUT);
+        // ember: as often as a datagram grows too old to write (MAX_SEND_WAIT, checked again as each is written):
+        // datagrams taken in while the relay connection was still being made, ten seconds and more on a lossy
+        // line, were all written the moment it came up (2026-11-12).
+        let mut send_datagram_flush = time::interval(MAX_SEND_WAIT.min(UNDELIVERABLE_DATAGRAM_TIMEOUT));
         send_datagram_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         send_datagram_flush.reset(); // Skip the immediate interval
 

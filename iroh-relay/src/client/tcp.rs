@@ -3,13 +3,39 @@
 //! system settings or its flight window. Physical Macs and loopback connections retain Tokio's normal I/O.
 //! Capping write() alone is insufficient: a closed congestion window coalesces queued writes.
 
-#[cfg(not(target_os = "macos"))]
+//!
+//! ember: and on every relay connection, what its socket has yet to send is kept small (UNSENT_MAX), so that what waits
+//! to be written waits in the relay actor's queue, where it is dropped once too old (`MAX_SEND_WAIT`), not in the
+//! socket's buffer (128 KB was seen), where it waits as long as a lossy line takes to send it (2026-11-12). The relay
+//! server does the same for what it sends to a client (server/http_server.rs, NOTSENT_LOWAT).
+
+/// ember: the most a relay connection's socket holds that it has not sent yet: a dozen datagrams.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+const UNSENT_MAX: u32 = 16 * 1024;
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub(super) use tokio::net::TcpStream;
 
-#[cfg(target_os = "macos")]
+/// ember: keeps what `stream` has yet to send to UNSENT_MAX (Linux and Android hold send() to it; Apple's are
+/// bounded by their own `TcpStream`). A loopback connection (a local proxy, which owns its outward carrier) is left as
+/// it is.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn bound_unsent(stream: &TcpStream) {
+    if stream.peer_addr().is_ok_and(|addr| addr.ip().is_loopback()) {
+        return;
+    }
+    if let Err(err) = socket2::SockRef::from(stream).set_tcp_notsent_lowat(UNSENT_MAX) {
+        tracing::debug!("TCP_NOTSENT_LOWAT not set: {err}");
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(super) fn bound_unsent(_stream: &TcpStream) {}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) use macos::TcpStream;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod macos {
     use std::{
         io::{self, IoSlice},
@@ -30,6 +56,8 @@ mod macos {
     pub(crate) struct TcpStream {
         inner: tokio::net::TcpStream,
         bounded: bool,
+        /// ember: an Apple virtual Mac's: no more than one segment unsent (the offload loss above); else UNSENT_MAX.
+        one_segment: bool,
     }
 
     fn virtual_mac() -> bool {
@@ -62,16 +90,16 @@ mod macos {
                     ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
                 }
             };
-            Self::from_stream(inner, !loopback && virtual_mac())
+            Self::from_stream(inner, !loopback, !loopback && virtual_mac())
         }
 
-        fn from_stream(inner: tokio::net::TcpStream, bounded: bool) -> io::Result<Self> {
+        fn from_stream(inner: tokio::net::TcpStream, bounded: bool, one_segment: bool) -> io::Result<Self> {
             if !bounded {
-                return Ok(Self { inner, bounded });
+                return Ok(Self { inner, bounded, one_segment });
             }
             inner.set_nodelay(true)?;
             // Public macOS <netinet/tcp.h>. Zero disables this option; one is its smallest enabled value.
-            let lowat: libc::c_int = 1;
+            let lowat: libc::c_int = if one_segment { 1 } else { super::UNSENT_MAX as libc::c_int };
             // SAFETY: fd belongs to inner and the option points to one initialized c_int; nothing is retained.
             let rc = unsafe {
                 libc::setsockopt(
@@ -85,7 +113,7 @@ mod macos {
             if rc != 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self { inner, bounded })
+            Ok(Self { inner, bounded, one_segment })
         }
 
         pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -128,6 +156,7 @@ mod macos {
                 return Poll::Ready(Ok(0));
             }
             let inner = &self.inner;
+            let one_segment = self.one_segment;
             loop {
                 ready!(inner.poll_write_ready(cx))?;
                 let result = inner.try_io(Interest::WRITABLE, || {
@@ -149,13 +178,18 @@ mod macos {
                     let socket = SockRef::from(inner);
                     // Read the current MSS (a path MTU change can lower it). Readiness permits <= 1 unsent
                     // byte, so reserve that byte as well: the kernel never has more than one segment to emit.
-                    let cap = socket
-                        .tcp_mss()?
-                        .checked_sub(1)
-                        .filter(|n| *n > 0)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "invalid TCP MSS")
-                        })? as usize;
+                    // ember: elsewhere readiness permits UNSENT_MAX unsent, and one write adds at most that much.
+                    let cap = if one_segment {
+                        socket
+                            .tcp_mss()?
+                            .checked_sub(1)
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidData, "invalid TCP MSS")
+                            })? as usize
+                    } else {
+                        super::UNSENT_MAX as usize
+                    };
                     socket.send(&buf[..buf.len().min(cap)])
                 });
                 match result {
@@ -208,6 +242,30 @@ mod macos {
             net::{TcpListener, TcpSocket},
         };
 
+        /// ember: a relay connection's socket keeps at most UNSENT_MAX unsent; an Apple virtual Mac's, one byte.
+        #[tokio::test]
+        async fn a_relay_connection_keeps_its_unsent_small() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            for (one_segment, want) in [(false, super::super::UNSENT_MAX as libc::c_int), (true, 1)] {
+                let inner = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+                let sender = TcpStream::from_stream(inner, true, one_segment).unwrap();
+                let mut lowat: libc::c_int = 0;
+                let mut len = std::mem::size_of_val(&lowat) as libc::socklen_t;
+                // SAFETY: reads one c_int option of a socket this test owns into a live c_int.
+                let rc = unsafe {
+                    libc::getsockopt(
+                        sender.inner.as_raw_fd(),
+                        libc::IPPROTO_TCP,
+                        TCP_NOTSENT_LOWAT,
+                        (&mut lowat as *mut libc::c_int).cast(),
+                        &mut len,
+                    )
+                };
+                assert_eq!(rc, 0);
+                assert_eq!(lowat, want);
+            }
+        }
+
         #[tokio::test]
         async fn loopback_keeps_native_vectored_io_and_large_writes() {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -235,7 +293,7 @@ mod macos {
             let sender = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
                 .await
                 .unwrap();
-            let sender = TcpStream::from_stream(sender, true).unwrap();
+            let sender = TcpStream::from_stream(sender, true, true).unwrap();
             let (receiver, _) = listener.accept().await.unwrap();
             (sender, receiver)
         }
@@ -329,7 +387,7 @@ mod macos {
                 let sender = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
                     .await
                     .unwrap();
-                let mut sender = TcpStream::from_stream(sender, true).unwrap();
+                let mut sender = TcpStream::from_stream(sender, true, true).unwrap();
                 let (receiver, _) = listener.accept().await.unwrap();
                 SockRef::from(&receiver)
                     .set_linger(Some(Duration::ZERO))

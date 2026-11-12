@@ -291,6 +291,7 @@ async fn dial_happy_eyeballs(
                         .inspect_err(|err| debug!("failed to connect: {err:#}"))?;
                     trace!("TCP stream connected");
                     stream.set_nodelay(true)?;
+                    super::tcp::bound_unsent(&stream);
                     Ok(stream)
                 }
                 .instrument(info_span!("connect", %addr)),
