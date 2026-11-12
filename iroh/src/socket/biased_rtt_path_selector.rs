@@ -172,11 +172,11 @@ impl PathSelector for BiasedRttPathSelector {
         // ember: with `custom_transports_last` or `relay_last`, that kind of path is left out once another kind has
         // an RTT.
         let backup = |path: &FourTuple| self.last.holds(path.addr_kind());
-        let others = ctx.paths().any(|psd| {
-            self.last != Last::Nothing
-                && !backup(psd.network_path())
-                && psd.stats().is_some_and(|stats| stats.same_path_rtt.is_some())
-        });
+        let others = self.last != Last::Nothing
+            && ctx.paths().any(|psd| {
+                !backup(psd.network_path())
+                    && psd.stats().is_some_and(|stats| stats.same_path_rtt.is_some())
+            });
 
         trace!("dumping path RTTs");
         for psd in ctx.paths() {
