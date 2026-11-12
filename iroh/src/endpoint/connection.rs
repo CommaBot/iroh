@@ -1158,6 +1158,18 @@ impl Connection<HandshakeCompleted> {
         self.data.paths.custom_opening()
     }
 
+    /// ember: how many path ids this connection lost to custom paths given up before they opened.
+    #[cfg(test)]
+    pub(crate) fn custom_paths_lost(&self) -> u32 {
+        self.data.paths.custom_lost()
+    }
+
+    /// ember: opens one more path to `addr` (beside any to it already), to show a path id is still free.
+    #[cfg(test)]
+    pub(crate) async fn open_another_path(&self, addr: std::net::SocketAddr) -> bool {
+        self.inner.open_path(addr, noq::PathStatus::Backup).await.is_ok()
+    }
+
     /// Returns a stream of [`PathList`] snapshots for this connection.
     ///
     /// Yields the current snapshot on the first poll, and a fresh
