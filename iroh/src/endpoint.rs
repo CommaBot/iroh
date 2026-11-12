@@ -863,6 +863,18 @@ impl Builder {
         self
     }
 
+    /// ember: chooses among direct paths and custom transports by RTT, and the relay only while none of them has
+    /// been measured, however fast the relay is: a backup, not a peer of the others. This is a trade made on purpose:
+    /// a custom transport that answers slowly (two seconds, say, a link that its own traffic fills) keeps the
+    /// connection though the relay answers faster, so a connection does not move back and forth between two paths
+    /// whose round trips each rise when they carry it. A path that stops answering leaves the choice only when it is
+    /// given up (the transport config's `default_path_max_idle_timeout`, which this does not change); the relay is
+    /// taken then. By default the relay ranks with the others by its RTT.
+    pub fn relay_last(mut self) -> Self {
+        self.path_selector = Arc::new(BiasedRttPathSelector::relay_last());
+        self
+    }
+
     /// Sets a custom [`PathSelector`] for this endpoint.
     ///
     /// The path selector decides which path to use among the candidate paths to a

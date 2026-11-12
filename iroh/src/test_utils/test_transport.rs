@@ -1075,12 +1075,21 @@ mod tests {
         }
     }
 
+    /// ember: how [`relay_and_custom`]'s endpoints choose a path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Route {
+        ByRtt,
+        CustomLast,
+        /// With paths given up after 3 s that carry nothing, kept alive every second (Comma's station).
+        RelayLast,
+    }
+
     /// ember: two endpoints on a relay behind `door` and on `network`'s custom transport, no IP, and the server's
     /// address with both; the server echoes every stream.
     async fn relay_and_custom(
         network: &TestNetwork,
         door: &RelayDoor,
-        custom_last: bool,
+        route: Route,
     ) -> Result<(Endpoint, Endpoint, EndpointAddr, tokio::task::JoinHandle<()>)> {
         const ALPN: &[u8] = b"ember/test/route";
         let bind = |secret: SecretKey| {
@@ -1094,7 +1103,16 @@ mod tests {
                     .add_custom_transport(transport.anyerr()?)
                     .clear_ip_transports()
                     .alpns(vec![ALPN.to_vec()]);
-                let builder = if custom_last { builder.custom_transports_last() } else { builder };
+                let builder = match route {
+                    Route::ByRtt => builder,
+                    Route::CustomLast => builder.custom_transports_last(),
+                    Route::RelayLast => builder.relay_last().transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_secs(1))
+                            .default_path_max_idle_timeout(Duration::from_secs(3))
+                            .build(),
+                    ),
+                };
                 builder.bind().await.anyerr()
             }
         };
@@ -1152,7 +1170,7 @@ mod tests {
         let (_map, relay_url, _relay_server) = run_relay_server().await?;
         let door = RelayDoor::to(&relay_url, Duration::from_millis(20)).await?;
         let network = TestNetwork::new();
-        let (server, client, addr, accepting) = relay_and_custom(&network, &door, true).await?;
+        let (server, client, addr, accepting) = relay_and_custom(&network, &door, Route::CustomLast).await?;
         let conn = client.connect(addr, b"ember/test/route").await.anyerr()?;
 
         until_selected(&conn, |a| matches!(a, TransportAddr::Relay(_))).await?;
@@ -1179,7 +1197,7 @@ mod tests {
         // The relay slower than the custom transport, which is selected then.
         let door = RelayDoor::to(&relay_url, Duration::from_millis(20)).await?;
         let network = TestNetwork::new();
-        let (server, client, addr, accepting) = relay_and_custom(&network, &door, false).await?;
+        let (server, client, addr, accepting) = relay_and_custom(&network, &door, Route::ByRtt).await?;
         let old = client.connect(addr.clone(), b"ember/test/route").await.anyerr()?;
         until_selected(&old, |a| matches!(a, TransportAddr::Custom(_))).await?;
 
@@ -1197,6 +1215,38 @@ mod tests {
 
         new.close(0u32.into(), b"done");
         old.close(0u32.into(), b"done");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: `relay_last` keeps a connection on the custom transport though the relay is faster. The custom
+    /// transport gone dead without a word, the connection goes to the relay within the time a path is given up in
+    /// (3 s here), on the same connection; mended, it is back on the custom transport.
+    #[tokio::test]
+    async fn relay_last_keeps_the_custom_transport_and_falls_back_in_bounded_time() -> Result<()> {
+        let (_map, relay_url, _relay_server) = run_relay_server().await?;
+        let door = RelayDoor::to(&relay_url, Duration::ZERO).await?;
+        let network = TestNetwork::new();
+        let (server, client, addr, accepting) = relay_and_custom(&network, &door, Route::RelayLast).await?;
+        let conn = client.connect(addr, b"ember/test/route").await.anyerr()?;
+
+        until_selected(&conn, |a| matches!(a, TransportAddr::Custom(_))).await?;
+        verify_echo(&conn, b"through the custom transport").await?;
+
+        network.black_hole(server.id());
+        let lost = std::time::Instant::now();
+        until_selected(&conn, |a| matches!(a, TransportAddr::Relay(_))).await?;
+        let took = lost.elapsed();
+        assert!(took < Duration::from_secs(10), "the relay was taken {took:?} after the custom transport went dead");
+        verify_echo(&conn, b"through the relay").await?;
+
+        network.mend(server.id());
+        until_selected(&conn, |a| matches!(a, TransportAddr::Custom(_))).await?;
+        verify_echo(&conn, b"through the custom transport again").await?;
+
+        conn.close(0u32.into(), b"done");
         accepting.abort();
         client.close().await;
         server.close().await;

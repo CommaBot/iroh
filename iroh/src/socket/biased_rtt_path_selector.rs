@@ -71,8 +71,30 @@ impl TransportBias {
 #[derive(Debug, Clone)]
 pub(crate) struct BiasedRttPathSelector {
     biases: Arc<FxHashMap<AddrKind, TransportBias>>,
-    /// ember: custom transports only while no other path has been measured (`Builder::custom_transports_last`).
-    custom_last: bool,
+    /// ember: a kind of path taken only while no other kind has been measured (`Builder::custom_transports_last`,
+    /// `Builder::relay_last`).
+    last: Last,
+}
+
+/// ember: which kind of path, if any, is a backup for the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Last {
+    /// Every path by its biased RTT.
+    Nothing,
+    /// Custom transports only while no direct path or relay has an RTT.
+    Custom,
+    /// The relay only while no direct path or custom transport has an RTT.
+    Relay,
+}
+
+impl Last {
+    fn holds(self, kind: AddrKind) -> bool {
+        match self {
+            Last::Nothing => false,
+            Last::Custom => matches!(kind, AddrKind::Custom(_)),
+            Last::Relay => kind == AddrKind::Relay,
+        }
+    }
 }
 
 impl Default for BiasedRttPathSelector {
@@ -86,7 +108,7 @@ impl Default for BiasedRttPathSelector {
         map.insert(AddrKind::Relay, TransportBias::primary());
         Self {
             biases: Arc::new(map),
-            custom_last: false,
+            last: Last::Nothing,
         }
     }
 }
@@ -96,7 +118,16 @@ impl BiasedRttPathSelector {
     /// however fast it is (`Builder::custom_transports_last`).
     pub(crate) fn custom_transports_last() -> Self {
         Self {
-            custom_last: true,
+            last: Last::Custom,
+            ..Self::default()
+        }
+    }
+
+    /// ember: direct paths and custom transports first, by RTT; the relay only while none of them has been measured,
+    /// however fast it is (`Builder::relay_last`).
+    pub(crate) fn relay_last() -> Self {
+        Self {
+            last: Last::Relay,
             ..Self::default()
         }
     }
@@ -108,7 +139,7 @@ impl BiasedRttPathSelector {
         map.insert(kind, bias);
         Self {
             biases: Arc::new(map),
-            custom_last: self.custom_last,
+            last: self.last,
         }
     }
 
@@ -138,18 +169,19 @@ impl PathSelector for BiasedRttPathSelector {
         let mut current_key: Option<i128> = None;
         let mut current_seen = false;
         let mut first = None;
-        // ember: with `custom_transports_last`, custom transports are left out once another path has an RTT.
-        let is_custom = |path: &FourTuple| matches!(path.addr_kind(), AddrKind::Custom(_));
-        let others = self.custom_last
-            && ctx.paths().any(|psd| {
-                !is_custom(psd.network_path())
-                    && psd.stats().is_some_and(|stats| stats.same_path_rtt.is_some())
-            });
+        // ember: with `custom_transports_last` or `relay_last`, that kind of path is left out once another kind has
+        // an RTT.
+        let backup = |path: &FourTuple| self.last.holds(path.addr_kind());
+        let others = ctx.paths().any(|psd| {
+            self.last != Last::Nothing
+                && !backup(psd.network_path())
+                && psd.stats().is_some_and(|stats| stats.same_path_rtt.is_some())
+        });
 
         trace!("dumping path RTTs");
         for psd in ctx.paths() {
             let network_path = psd.network_path();
-            if others && is_custom(network_path) {
+            if others && backup(network_path) {
                 continue;
             }
             current_seen |= Some(network_path) == current;
@@ -394,6 +426,64 @@ mod tests {
         assert_eq!(
             select_with_default(None, vec![psd(&custom, 1), psd(&relay, 50)]).as_ref(),
             Some(&custom)
+        );
+    }
+
+    /// ember: `relay_last` takes the relay only while no direct path or custom transport has an RTT: those however
+    /// much slower, between themselves by RTT as by default, and the relay again once none has an RTT.
+    #[test]
+    fn relay_last_only_without_another_path() {
+        let custom = custom(7);
+        let relay = relay(1);
+        let ip = v4(1);
+        let select = |current: Option<&transports::FourTuple>, paths| {
+            let ctx = PathSelectionContext::for_test(current, paths);
+            BiasedRttPathSelector::relay_last().select(&ctx).selected().cloned()
+        };
+
+        // Only the relay measured: it is taken.
+        assert_eq!(select(None, vec![psd(&relay, 10)]).as_ref(), Some(&relay));
+        // The custom transport measured, ten times slower: the custom transport, and from the relay too.
+        assert_eq!(select(None, vec![psd(&custom, 100), psd(&relay, 10)]).as_ref(), Some(&custom));
+        assert_eq!(
+            select(Some(&relay), vec![psd(&custom, 100), psd(&relay, 10)]).as_ref(),
+            Some(&custom)
+        );
+        // On the custom transport, a relay that got faster is not switched to.
+        assert_eq!(select(Some(&custom), vec![psd(&custom, 2_000), psd(&relay, 10)]), None);
+        // A direct path is preferred over the relay the same way.
+        assert_eq!(select(Some(&relay), vec![psd(&ip, 100), psd(&relay, 10)]).as_ref(), Some(&ip));
+        // Direct paths and custom transports between themselves: by RTT, as by default.
+        assert_eq!(select(None, vec![psd(&ip, 10), psd(&custom, 100)]).as_ref(), Some(&ip));
+        assert_eq!(select(None, vec![psd(&ip, 100), psd(&custom, 10)]).as_ref(), Some(&custom));
+        assert_eq!(
+            select_with_default(None, vec![psd(&ip, 100), psd(&custom, 10)]).as_ref(),
+            Some(&custom)
+        );
+        // The custom transport's path gone: the relay.
+        assert_eq!(select(Some(&custom), vec![psd(&relay, 10)]).as_ref(), Some(&relay));
+        // A custom transport not measured yet does not keep the relay out.
+        let unmeasured = PathSelectionData::for_test(&custom, Some(PathStats::default()));
+        assert_eq!(select(None, vec![unmeasured, psd(&relay, 10)]).as_ref(), Some(&relay));
+    }
+
+    /// ember: by default the relay ranks with the others by its RTT: faster, it is taken over a custom transport,
+    /// and switched to from one by the usual margin.
+    #[test]
+    fn by_default_the_relay_ranks_by_its_rtt() {
+        let custom = custom(7);
+        let relay = relay(1);
+        assert_eq!(
+            select_with_default(None, vec![psd(&custom, 100), psd(&relay, 10)]).as_ref(),
+            Some(&relay)
+        );
+        assert_eq!(
+            select_with_default(Some(&custom), vec![psd(&custom, 100), psd(&relay, 70)]).as_ref(),
+            Some(&relay)
+        );
+        assert_eq!(
+            select_with_default(Some(&custom), vec![psd(&custom, 100), psd(&relay, 80)]),
+            None
         );
     }
 

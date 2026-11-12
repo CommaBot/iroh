@@ -345,7 +345,7 @@ impl PathStateReceiver {
     }
 
     /// ember: the connection's tries to open a custom path that left one missing, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "unstable-custom-transports"))]
     pub(crate) fn custom_tries(&self) -> u32 {
         self.shared
             .custom_tries
@@ -353,7 +353,7 @@ impl PathStateReceiver {
     }
 
     /// ember: the connection's custom paths being opened still, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "unstable-custom-transports"))]
     pub(crate) fn custom_opening(&self) -> u32 {
         self.shared
             .custom_opening
@@ -361,7 +361,7 @@ impl PathStateReceiver {
     }
 
     /// ember: the path ids the connection lost to custom paths given up before they opened, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "unstable-custom-transports"))]
     pub(crate) fn custom_lost(&self) -> u32 {
         self.shared
             .custom_lost
