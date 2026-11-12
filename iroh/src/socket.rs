@@ -1356,7 +1356,7 @@ impl EndpointInner {
     }
 
     #[cfg(all(test, with_crypto_provider))]
-    async fn force_network_change(&self, is_major: bool) {
+    pub(crate) async fn force_network_change(&self, is_major: bool) {
         self.actor_sender
             .send(ActorMessage::ForceNetworkChange(is_major))
             .await

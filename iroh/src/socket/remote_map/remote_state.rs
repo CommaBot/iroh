@@ -79,7 +79,8 @@ const CUSTOM_PATH_RETRY: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const CUSTOM_PATH_RETRY_MAX: Duration = Duration::from_millis(1500);
 /// ember: how many times a connection tries again after its first try (the timer's: after 2, 4, 8, 16 and 30 s, about a
-/// minute) before it stops until a custom path opens on it or the remote's custom addresses change. A try is counted
+/// minute) before it stops until a custom path opens on it, the remote's custom addresses change or the network changes
+/// (major). A try is counted
 /// whatever asked for it (the timer, an address lookup that found nothing new, another dial): each one that fails takes
 /// one of the connection's path ids, which the remote never gives back for a path it did not see, and a custom transport
 /// that never answers must not use up the ids a direct path needs later.
@@ -634,6 +635,14 @@ impl RemoteStateActor {
         }
 
         if is_major {
+            // ember: on another network a custom transport that never answered may now (Salix reached again): every
+            // connection gets its tries back.
+            self.reset_custom_retry();
+            for conn_state in self.connections.values_mut() {
+                conn_state.custom_tries = 0;
+                conn_state.path_state.record_custom_tries(0);
+            }
+            self.open_custom_paths();
             self.trigger_holepunching();
         }
     }

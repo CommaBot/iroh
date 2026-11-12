@@ -767,6 +767,34 @@ mod tests {
         Ok(())
     }
 
+    /// ember: a connection whose tries to open a custom path are over (the custom transport dropped everything) is not
+    /// tried again without an event, and is once the network changes (major): then the custom path opens and is
+    /// selected.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_custom_path_tried_again_on_a_major_network_change() -> Result<()> {
+        let network = TestNetwork::new();
+        let (ep1, ep2, router, s2) = custom_later_endpoints(&network).await?;
+        network.set_dropping(true);
+        let conn = ep1.connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN).await?;
+        until(60, "the connection's tries were not over", || conn.custom_path_tries() == 6).await;
+        // The last try is given up 3 s after it goes quiet.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        network.set_dropping(false);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!is_custom_selected(&conn), "tried again without an event: {:?}", conn.paths());
+
+        ep1.inner().anyerr()?.force_network_change(true).await;
+        until(10, &format!("the custom path was not tried again on the network change: {:?}", conn.paths()), || {
+            is_custom_selected(&conn)
+        })
+        .await;
+        verify_echo(&conn, b"custom after network change").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
     /// Test that IP is selected over custom transport when custom has an RTT disadvantage.
     #[tokio::test]
     #[traced_test]
