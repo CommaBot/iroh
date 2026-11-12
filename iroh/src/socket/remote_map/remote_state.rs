@@ -68,6 +68,8 @@ const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// ember: how many times a client connection tries again to open a path to a custom transport address it lacks one
 /// to, after its first try (`RemoteStateActor::open_custom_paths`), before it stops until a custom path opens on it or
 /// the remote's custom addresses change. A try is a new path id taken; one already in flight is no new try.
+/// A remote with several custom addresses missing uses one try per address in the same round, so it gets fewer rounds
+/// (two custom addresses: tries at about 0 and 11 s); Comma's mesh gives each remote a single Salix address.
 const CUSTOM_PATH_TRIES: u32 = 2;
 /// ember: how long after a try starts the next may: whatever asks for one sooner (an address lookup, another dial)
 /// waits, so the tries keep this pace however often they are asked for. A try that fails is given up after about
