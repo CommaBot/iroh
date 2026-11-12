@@ -122,6 +122,11 @@ impl TestNetwork {
     pub fn black_hole(&self, id: EndpointId) {
         self.inner.lock().expect("poisoned").black_holes.insert(id);
     }
+
+    /// ember: carries packets to `id` again after [`Self::black_hole`].
+    pub fn mend(&self, id: EndpointId) {
+        self.inner.lock().expect("poisoned").black_holes.remove(&id);
+    }
 }
 
 #[derive(Debug)]
@@ -596,6 +601,51 @@ mod tests {
         );
 
         verify_echo(&conn, b"custom wins").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// ember: a connection whose first path is IP, made while the custom transport dropped every packet (Salix's
+    /// socket before it is registered), opens a path through the custom transport once it carries packets, and
+    /// selects it. Its first path was the only one it ever had over a custom transport before.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_custom_path_opened_after_ip_won_the_handshake() -> Result<()> {
+        let network = TestNetwork::new();
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+
+        let custom_bias = TransportBias::primary().with_rtt_advantage(Duration::from_secs(10));
+        let config = EndpointConfig::default()
+            .with_ip()
+            .with_custom_bias(custom_bias);
+
+        let ep1 = endpoint_builder(s1, t1, config.clone()).bind().await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        network.black_hole(s2.public());
+        let conn = ep1
+            .connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN)
+            .await?;
+        assert!(!is_custom_selected(&conn), "the custom transport carried nothing yet");
+
+        network.mend(s2.public());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !is_custom_selected(&conn) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the custom path was never opened: {:?}",
+                conn.paths()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        verify_echo(&conn, b"custom after ip").await?;
         conn.close(0u32.into(), b"done");
         router.shutdown().await.anyerr()?;
         Ok(())
