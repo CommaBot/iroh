@@ -71,6 +71,8 @@ impl TransportBias {
 #[derive(Debug, Clone)]
 pub(crate) struct BiasedRttPathSelector {
     biases: Arc<FxHashMap<AddrKind, TransportBias>>,
+    /// ember: custom transports only while no other path has been measured (`Builder::custom_transports_last`).
+    custom_last: bool,
 }
 
 impl Default for BiasedRttPathSelector {
@@ -84,11 +86,21 @@ impl Default for BiasedRttPathSelector {
         map.insert(AddrKind::Relay, TransportBias::primary());
         Self {
             biases: Arc::new(map),
+            custom_last: false,
         }
     }
 }
 
 impl BiasedRttPathSelector {
+    /// ember: direct paths and the relay first, by RTT; a custom transport only while none of them has been measured,
+    /// however fast it is (`Builder::custom_transports_last`).
+    pub(crate) fn custom_transports_last() -> Self {
+        Self {
+            custom_last: true,
+            ..Self::default()
+        }
+    }
+
     /// Returns a new selector with the given bias added or updated for `kind`.
     #[cfg(all(test, feature = "unstable-custom-transports"))]
     pub(crate) fn with_bias(self, kind: AddrKind, bias: TransportBias) -> Self {
@@ -96,6 +108,7 @@ impl BiasedRttPathSelector {
         map.insert(kind, bias);
         Self {
             biases: Arc::new(map),
+            custom_last: self.custom_last,
         }
     }
 
@@ -125,10 +138,20 @@ impl PathSelector for BiasedRttPathSelector {
         let mut current_key: Option<i128> = None;
         let mut current_seen = false;
         let mut first = None;
+        // ember: with `custom_transports_last`, custom transports are left out once another path has an RTT.
+        let is_custom = |path: &FourTuple| matches!(path.addr_kind(), AddrKind::Custom(_));
+        let others = self.custom_last
+            && ctx.paths().any(|psd| {
+                !is_custom(psd.network_path())
+                    && psd.stats().is_some_and(|stats| stats.same_path_rtt.is_some())
+            });
 
         trace!("dumping path RTTs");
         for psd in ctx.paths() {
             let network_path = psd.network_path();
+            if others && is_custom(network_path) {
+                continue;
+            }
             current_seen |= Some(network_path) == current;
             if first.is_none() {
                 first = Some(psd.clone());
@@ -336,6 +359,42 @@ mod tests {
         let v4_2 = v4(2);
         let chosen = select_with_default(None, vec![psd(&v4_1, 20), psd(&v4_2, 10)]);
         assert_eq!(chosen.as_ref(), Some(&v4_2));
+    }
+
+    fn custom(id: u64) -> transports::FourTuple {
+        transports::FourTuple::from_remote(Addr::Custom(iroh_base::CustomAddr::from_parts(id, &[1u8; 32])))
+    }
+
+    /// ember: `custom_transports_last` takes a custom transport only while no other path has an RTT: the relay
+    /// however much slower, and the custom transport again once the relay has none.
+    #[test]
+    fn custom_transports_last_only_without_another_path() {
+        let custom = custom(7);
+        let relay = relay(1);
+        let select = |current: Option<&transports::FourTuple>, paths| {
+            let ctx = PathSelectionContext::for_test(current, paths);
+            BiasedRttPathSelector::custom_transports_last()
+                .select(&ctx)
+                .selected()
+                .cloned()
+        };
+
+        // Only the custom transport measured: it is taken.
+        assert_eq!(select(None, vec![psd(&custom, 1)]).as_ref(), Some(&custom));
+        // The relay measured, fifty times slower: the relay, and from the custom transport too.
+        assert_eq!(select(None, vec![psd(&custom, 1), psd(&relay, 50)]).as_ref(), Some(&relay));
+        assert_eq!(
+            select(Some(&custom), vec![psd(&custom, 1), psd(&relay, 50)]).as_ref(),
+            Some(&relay)
+        );
+        // The relay's path gone: the custom transport.
+        assert_eq!(select(Some(&relay), vec![psd(&custom, 1)]).as_ref(), Some(&custom));
+
+        // By default the faster wins.
+        assert_eq!(
+            select_with_default(None, vec![psd(&custom, 1), psd(&relay, 50)]).as_ref(),
+            Some(&custom)
+        );
     }
 
     #[test]

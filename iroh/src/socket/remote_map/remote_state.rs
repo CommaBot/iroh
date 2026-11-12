@@ -65,6 +65,10 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 /// Even if we have some non-relay route that works.
 const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// ember: how soon a client connection tries again to open a path to a custom transport address it lacks one to
+/// (`RemoteStateActor::open_custom_paths`).
+const CUSTOM_PATH_RETRY: Duration = Duration::from_secs(2);
+
 /// ember: how often the path is chosen again from its connections' paths' RTTs. Chosen only as a path opened, was
 /// established or was given up, a connection stayed on a relay whose path had gone seconds slow (its queue to a phone
 /// growing) while another relay's answered in a few hundred milliseconds (2026-10-30, minutes long).
@@ -192,6 +196,8 @@ struct State {
     several_relays: bool,
     /// ember: when the relay paths missing are opened again (`RemoteStateActor::reopen_relay_paths`).
     relay_reopen_at: Option<Instant>,
+    /// ember: when to next try opening paths to the custom transport addresses a client connection lacks.
+    scheduled_custom_open: Option<Instant>,
 }
 
 /// ember: how many of the last datagrams sent before a path was selected are kept for [`State::unanswered`].
@@ -235,6 +241,7 @@ impl RemoteStateActor {
                 unanswered: None,
                 several_relays,
                 relay_reopen_at: None,
+                scheduled_custom_open: None,
             },
         }
     }
@@ -301,6 +308,11 @@ impl RemoteStateActor {
                 None => MaybeFuture::None,
             };
             n0_future::pin!(relay_reopen);
+            let scheduled_custom_open = match self.state.scheduled_custom_open {
+                Some(when) => MaybeFuture::Some(time::sleep_until(when)),
+                None => MaybeFuture::None,
+            };
+            n0_future::pin!(scheduled_custom_open);
             if !self.is_idle(&inbox) {
                 idle_timeout
                     .as_mut()
@@ -355,6 +367,11 @@ impl RemoteStateActor {
                 }
                 Some(item) = maybe_next(self.state.address_lookup_stream.as_mut()), if self.state.address_lookup_stream.is_some() => {
                     self.state.handle_address_lookup_item(item, &mut send_tasks);
+                    self.open_custom_paths();
+                }
+                _ = &mut scheduled_custom_open => {
+                    self.state.scheduled_custom_open = None;
+                    self.open_custom_paths();
                 }
                 _ = &mut relay_reopen => {
                     self.state.relay_reopen_at = None;
@@ -409,6 +426,7 @@ impl RemoteStateActor {
             }
             RemoteStateMessage::ResolveRemote(addrs, tx) => {
                 self.state.handle_msg_resolve_remote(addrs, tx);
+                self.open_custom_paths();
             }
             RemoteStateMessage::RemoteInfo(tx) => {
                 let addrs = self.state.paths.to_remote_addrs();
@@ -489,9 +507,55 @@ impl RemoteStateActor {
                 }
             }
         }
+        self.open_custom_paths();
         self.trigger_holepunching();
         self.select_path();
         tx.send(path_state_receiver).ok();
+    }
+
+    /// ember: opens a path on each client connection to every custom transport address of the remote it has none
+    /// to, and tries again every [`CUSTOM_PATH_RETRY`] while one is missing.
+    ///
+    /// A connection's first path is whichever transport answered its Initial packets first, and only relay paths are
+    /// opened beside it otherwise: a connection whose first path went through a relay or IP never had a custom path, so
+    /// the path selector, which picks among open paths, never chose it whatever its RTT. A custom transport that drops
+    /// packets for a while (a relay socket of the app's before it is registered) also lost its path for good once it
+    /// was abandoned.
+    fn open_custom_paths(&mut self) {
+        let custom: Vec<transports::Addr> = self
+            .state
+            .paths
+            .addrs()
+            .filter(|addr| matches!(addr, transports::Addr::Custom(_)))
+            .cloned()
+            .collect();
+        if custom.is_empty() {
+            return;
+        }
+        let mut missing = false;
+        for (conn_id, conn_state) in self.connections.iter() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            if !conn.side().is_client() {
+                continue;
+            }
+            for addr in &custom {
+                if conn_state.paths.values().any(|open| &open.remote() == addr) {
+                    continue;
+                }
+                missing = true;
+                self.state.open_path_on_conn(
+                    *conn_id,
+                    conn_state,
+                    &conn,
+                    &transports::FourTuple::from_remote(addr.clone()),
+                );
+            }
+        }
+        if missing && self.state.scheduled_custom_open.is_none() {
+            self.state.scheduled_custom_open = Some(Instant::now() + CUSTOM_PATH_RETRY);
+        }
     }
 
     /// Handles [`RemoteStateMessage::NetworkChange`].
@@ -673,6 +737,10 @@ impl RemoteStateActor {
                 // ember: a relay's path, tried again a moment later (`reopen_relay_paths`).
                 if network_path.is_relay() && self.state.several_relays {
                     self.state.relay_reopen_at = Some(Instant::now() + RELAY_REOPEN);
+                }
+                // ember: a custom path given up is opened again (`open_custom_paths`).
+                if matches!(network_path.remote(), transports::Addr::Custom(_)) {
+                    self.open_custom_paths();
                 }
             }
             NoqPathEvent::Discarded { id, path_stats, .. } => {
@@ -870,64 +938,55 @@ impl State {
         // though we might not have a relay transport or ip-capable transport set up.
         // So these errors must not be fatal for this actor (or even this operation).
 
-        // Initial packets belong to a new connection, while selected_path belongs to the peer.
-        // With every relay available, race them again: an older connection's selection may have
-        // become slow before its next RTT sample or path reselection. Established packets use
-        // their concrete path in TransportsSender and do not enter this branch.
-        let targets = if let Some(addr) = self.selected_path.as_ref().filter(|_| !self.several_relays) {
-            trace!(?addr, "sending datagram to selected path");
+        // Initial packets belong to a new connection, while selected_path belongs to the peer: race them on every
+        // known path even while a path is selected. An older connection's selection may have become slow before its
+        // next RTT sample or path reselection, or dead: a peer whose process restarted on another port is reached
+        // through the relay at once, but its old direct path stays selected until the old connection times out (28 s
+        // measured). Established packets use their concrete path in TransportsSender and do not come here.
+        trace!(
+            paths = ?self.paths.addrs().collect::<Vec<_>>(),
+            "sending datagram to all known paths",
+        );
+        // ember: kept for addresses found later (see `unanswered`).
+        if self.selected_path.is_none() {
+            match &mut self.unanswered {
+                Some((kept_sender, kept)) => {
+                    *kept_sender = sender.clone();
+                    if kept.len() == UNANSWERED_KEPT {
+                        kept.remove(0);
+                    }
+                    kept.push(transmit.clone());
+                }
+                None => self.unanswered = Some((sender.clone(), vec![transmit.clone()])),
+            }
+        }
+        if self.paths.is_empty() {
+            warn!("Cannot send datagrams: No paths to remote endpoint known");
+        }
+
+        let mut targets = Vec::new();
+        for addr in self.paths.addrs() {
+            // We never want to send to our local addresses.
+            // The local address set is updated in the main loop so we can use `peek` here.
+            if let transports::Addr::Ip(sockaddr) = addr
+                && self
+                    .local_direct_addrs
+                    .peek()
+                    .iter()
+                    .any(|a| a.addr == *sockaddr)
+            {
+                trace!(%sockaddr, "not sending datagram to our own address");
 
             // TODO(Frando): We might want to include a local IP here in the future, if we confidently
             // know that it is the correct one.
             // See https://github.com/n0-computer/iroh/issues/4280.
-            vec![transports::FourTuple::from_remote(addr.remote())]
-        } else {
-            trace!(
-                paths = ?self.paths.addrs().collect::<Vec<_>>(),
-                "sending datagram to all known paths",
-            );
-            // ember: kept for addresses found later (see `unanswered`).
-            if self.selected_path.is_none() {
-                match &mut self.unanswered {
-                    Some((kept_sender, kept)) => {
-                        *kept_sender = sender.clone();
-                        if kept.len() == UNANSWERED_KEPT {
-                            kept.remove(0);
-                        }
-                        kept.push(transmit.clone());
-                    }
-                    None => self.unanswered = Some((sender.clone(), vec![transmit.clone()])),
-                }
+            } else {
+                targets.push(transports::FourTuple::from_remote(addr.clone()));
             }
-            if self.paths.is_empty() {
-                warn!("Cannot send datagrams: No paths to remote endpoint known");
-            }
-
-            let mut targets = Vec::new();
-            for addr in self.paths.addrs() {
-                // We never want to send to our local addresses.
-                // The local address set is updated in the main loop so we can use `peek` here.
-                if let transports::Addr::Ip(sockaddr) = addr
-                    && self
-                        .local_direct_addrs
-                        .peek()
-                        .iter()
-                        .any(|a| a.addr == *sockaddr)
-                {
-                    trace!(%sockaddr, "not sending datagram to our own address");
-
-                // TODO(Frando): We might want to include a local IP here in the future, if we confidently
-                // know that it is the correct one.
-                // See https://github.com/n0-computer/iroh/issues/4280.
-                } else {
-                    targets.push(transports::FourTuple::from_remote(addr.clone()));
-                }
-            }
-            // This message is received *before* a connection is added.  So we do
-            // not yet have a connection to holepunch.  Instead we trigger
-            // holepunching when AddConnection is received.
-            targets
-        };
+        }
+        // This message is received *before* a connection is added.  So we do
+        // not yet have a connection to holepunch.  Instead we trigger
+        // holepunching when AddConnection is received.
         queue_datagram(send_tasks, sender, transmit, targets);
     }
 

@@ -117,6 +117,16 @@ impl TestNetwork {
             id,
         }))
     }
+
+    /// ember: from now on what is sent to `id` is lost on the way, as on a path that went dead without a word.
+    pub fn black_hole(&self, id: EndpointId) {
+        self.inner.lock().expect("poisoned").black_holes.insert(id);
+    }
+
+    /// ember: carries packets to `id` again after [`Self::black_hole`].
+    pub fn mend(&self, id: EndpointId) {
+        self.inner.lock().expect("poisoned").black_holes.remove(&id);
+    }
 }
 
 #[derive(Debug)]
@@ -127,6 +137,8 @@ struct TestAddrLookup {
 #[derive(Debug, Default)]
 struct TestNetworkInner {
     channels: BTreeMap<EndpointId, (mpsc::Sender<Packet>, mpsc::Receiver<Packet>)>,
+    /// ember: endpoints whose packets are lost on the way (`TestNetwork::black_hole`).
+    black_holes: std::collections::BTreeSet<EndpointId>,
 }
 
 impl AddressLookup for TestAddrLookup {
@@ -187,6 +199,9 @@ impl TestSender {
     fn send_sync(&self, dst: &CustomAddr, packets: Vec<Packet>) -> io::Result<()> {
         let to_id = try_parse_custom_addr(dst)?;
         let guard = self.network.inner.lock().expect("poisoned");
+        if guard.black_holes.contains(&to_id) {
+            return Ok(());
+        }
         let (s, _) = guard
             .channels
             .get(&to_id)
@@ -456,6 +471,18 @@ mod tests {
             .is_some_and(|p| p.is_relay())
     }
 
+    /// ember: waits until `settled` holds of `conn`'s paths, as they are chosen after the handshake. Not a deadline:
+    /// a test asserts it afterwards, and 30 s only keeps a broken run from hanging. A fixed wait of 100-200 ms lost
+    /// to a busy CI machine.
+    async fn settle(conn: &crate::endpoint::Connection, settled: fn(&crate::endpoint::Connection) -> bool) {
+        let _ = tokio::time::timeout(Duration::from_secs(30), async {
+            while !settled(conn) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
     /// Verifies echo works over the connection.
     async fn verify_echo(conn: &crate::endpoint::Connection, msg: &[u8]) -> Result<()> {
         let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
@@ -566,8 +593,7 @@ mod tests {
             .connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN)
             .await?;
 
-        // Wait for paths to settle
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        settle(&conn, is_custom_selected).await;
 
         assert!(
             is_custom_selected(&conn),
@@ -575,6 +601,51 @@ mod tests {
         );
 
         verify_echo(&conn, b"custom wins").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// ember: a connection whose first path is IP, made while the custom transport dropped every packet (Salix's
+    /// socket before it is registered), opens a path through the custom transport once it carries packets, and
+    /// selects it. Its first path was the only one it ever had over a custom transport before.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_custom_path_opened_after_ip_won_the_handshake() -> Result<()> {
+        let network = TestNetwork::new();
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+
+        let custom_bias = TransportBias::primary().with_rtt_advantage(Duration::from_secs(10));
+        let config = EndpointConfig::default()
+            .with_ip()
+            .with_custom_bias(custom_bias);
+
+        let ep1 = endpoint_builder(s1, t1, config.clone()).bind().await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        network.black_hole(s2.public());
+        let conn = ep1
+            .connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN)
+            .await?;
+        assert!(!is_custom_selected(&conn), "the custom transport carried nothing yet");
+
+        network.mend(s2.public());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !is_custom_selected(&conn) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the custom path was never opened: {:?}",
+                conn.paths()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        verify_echo(&conn, b"custom after ip").await?;
         conn.close(0u32.into(), b"done");
         router.shutdown().await.anyerr()?;
         Ok(())
@@ -605,8 +676,7 @@ mod tests {
             .connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN)
             .await?;
 
-        // Wait for paths to settle
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        settle(&conn, is_ip_selected_from_ip_and_custom).await;
 
         assert!(
             is_ip_selected_from_ip_and_custom(&conn),
@@ -686,8 +756,7 @@ mod tests {
 
             let conn = ep1.connect(relay_only_addr, ECHO_ALPN).await?;
 
-            // Wait for relay path to be established
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            settle(&conn, is_relay_selected).await;
 
             // Debug: print paths after relay-only connect
             let paths = conn.paths();
@@ -715,8 +784,7 @@ mod tests {
         // Now connect with all addresses (relay + custom)
         let conn = ep1.connect(all_addrs, ECHO_ALPN).await?;
 
-        // Wait for paths to settle
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        settle(&conn, is_custom_selected).await;
 
         // Debug: print all paths
         let paths = conn.paths();
@@ -739,6 +807,214 @@ mod tests {
         verify_echo(&conn, b"custom wins over relay").await?;
         conn.close(0u32.into(), b"done");
         router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// ember: a relay's front door, a TCP proxy the test slows and shuts: what goes through it waits `delay` ms
+    /// either way; shut, it drops what runs through it and takes nothing new.
+    struct RelayDoor {
+        url: crate::RelayUrl,
+        open: Arc<std::sync::atomic::AtomicBool>,
+        running: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl RelayDoor {
+        async fn to(relay: &crate::RelayUrl, delay: Duration) -> Result<Self> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.anyerr()?;
+            let port = listener.local_addr().anyerr()?.port();
+            let host = relay.host_str().expect("host").to_string();
+            let target = format!("{host}:{}", relay.port().expect("port"));
+            let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let running: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
+            let (accepting, tasks) = (open.clone(), running.clone());
+            tokio::spawn(async move {
+                while let Ok((inbound, _)) = listener.accept().await {
+                    if !accepting.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
+                    let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
+                        continue;
+                    };
+                    let (down_read, down_write) = inbound.into_split();
+                    let (up_read, up_write) = outbound.into_split();
+                    let ways: [(
+                        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                    ); 2] = [
+                        (Box::new(down_read), Box::new(up_write)),
+                        (Box::new(up_read), Box::new(down_write)),
+                    ];
+                    for (mut from, mut to) in ways {
+                        // A delay line: each read goes on `delay` after it came, in order.
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+                        let mut held = tasks.lock().unwrap();
+                        held.push(tokio::spawn(async move {
+                            let mut buf = vec![0u8; 64 * 1024];
+                            while let Ok(n) = from.read(&mut buf).await {
+                                if n == 0
+                                    || tx.send((tokio::time::Instant::now() + delay, buf[..n].to_vec())).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }));
+                        held.push(tokio::spawn(async move {
+                            while let Some((at, bytes)) = rx.recv().await {
+                                tokio::time::sleep_until(at).await;
+                                if to.write_all(&bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }));
+                    }
+                }
+            });
+            Ok(Self {
+                url: format!("https://{host}:{port}").parse().expect("url"),
+                open,
+                running,
+            })
+        }
+
+        fn shut(&self) {
+            self.open.store(false, std::sync::atomic::Ordering::SeqCst);
+            for task in self.running.lock().unwrap().drain(..) {
+                task.abort();
+            }
+        }
+
+        fn reopen(&self) {
+            self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// ember: two endpoints on a relay behind `door` and on `network`'s custom transport, no IP, and the server's
+    /// address with both; the server echoes every stream.
+    async fn relay_and_custom(
+        network: &TestNetwork,
+        door: &RelayDoor,
+        custom_last: bool,
+    ) -> Result<(Endpoint, Endpoint, EndpointAddr, tokio::task::JoinHandle<()>)> {
+        const ALPN: &[u8] = b"ember/test/route";
+        let bind = |secret: SecretKey| {
+            let transport = network.create_transport(secret.public());
+            let url = door.url.clone();
+            async move {
+                let builder = Endpoint::builder(presets::Minimal)
+                    .secret_key(secret)
+                    .relay_mode(RelayMode::Custom(RelayMap::from_iter([url])))
+                    .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
+                    .add_custom_transport(transport.anyerr()?)
+                    .clear_ip_transports()
+                    .alpns(vec![ALPN.to_vec()]);
+                let builder = if custom_last { builder.custom_transports_last() } else { builder };
+                builder.bind().await.anyerr()
+            }
+        };
+        let server = bind(SecretKey::generate()).await?;
+        let client = bind(SecretKey::generate()).await?;
+        server.online().await;
+        let server_id = server.id();
+        let addr = EndpointAddr::from_parts(
+            server_id,
+            [
+                TransportAddr::Relay(door.url.clone()),
+                TransportAddr::Custom(to_custom_addr(server_id)),
+            ],
+        );
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                while let Some(incoming) = server.accept().await {
+                    let Ok(conn) = incoming.await else { continue };
+                    tokio::spawn(async move {
+                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            tokio::spawn(async move {
+                                let _ = tokio::io::copy(&mut recv, &mut send).await;
+                                let _ = send.finish();
+                            });
+                        }
+                    });
+                }
+            }
+        });
+        Ok((server, client, addr, accepting))
+    }
+
+    fn selected(conn: &Connection) -> Option<TransportAddr> {
+        conn.paths().iter().find(|p| p.is_selected()).map(|p| p.remote_addr().clone())
+    }
+
+    /// Echoes on `conn` until its selected path is `wanted`: a dead path is found by what it does not carry. The
+    /// timeout only keeps a broken run from hanging.
+    async fn until_selected(conn: &Connection, wanted: fn(&TransportAddr) -> bool) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !selected(conn).as_ref().is_some_and(wanted) {
+                let _ = tokio::time::timeout(Duration::from_millis(300), verify_echo(conn, b"are you there")).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .anyerr()
+    }
+
+    /// ember: `custom_transports_last` carries a connection on the relay though the custom transport is faster; the
+    /// relay lost, on the custom transport.
+    #[tokio::test]
+    async fn custom_transports_last_prefers_the_relay_and_falls_back() -> Result<()> {
+        let (_map, relay_url, _relay_server) = run_relay_server().await?;
+        let door = RelayDoor::to(&relay_url, Duration::from_millis(20)).await?;
+        let network = TestNetwork::new();
+        let (server, client, addr, accepting) = relay_and_custom(&network, &door, true).await?;
+        let conn = client.connect(addr, b"ember/test/route").await.anyerr()?;
+
+        until_selected(&conn, |a| matches!(a, TransportAddr::Relay(_))).await?;
+        verify_echo(&conn, b"through the relay").await?;
+
+        door.shut();
+        until_selected(&conn, |a| matches!(a, TransportAddr::Custom(_))).await?;
+        verify_echo(&conn, b"through the custom transport").await?;
+        door.reopen();
+
+        conn.close(0u32.into(), b"done");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: a new connection's handshake goes on every path while an older connection to the same peer has one
+    /// selected. That path dead without a word (the peer's process restarted on another port), the older connection
+    /// keeps it selected until it gives it up; the new one is made through the relay meanwhile.
+    #[tokio::test]
+    async fn a_new_connection_races_every_path_while_an_older_one_has_one_selected() -> Result<()> {
+        let (_map, relay_url, _relay_server) = run_relay_server().await?;
+        // The relay slower than the custom transport, which is selected then.
+        let door = RelayDoor::to(&relay_url, Duration::from_millis(20)).await?;
+        let network = TestNetwork::new();
+        let (server, client, addr, accepting) = relay_and_custom(&network, &door, false).await?;
+        let old = client.connect(addr.clone(), b"ember/test/route").await.anyerr()?;
+        until_selected(&old, |a| matches!(a, TransportAddr::Custom(_))).await?;
+
+        network.black_hole(server.id());
+        let new = tokio::time::timeout(Duration::from_secs(60), client.connect(addr, b"ember/test/route"))
+            .await
+            .anyerr()?
+            .anyerr()?;
+        assert!(
+            matches!(selected(&old), Some(TransportAddr::Custom(_))),
+            "the new connection waited for the older one to give its dead path up: {:?}",
+            selected(&old)
+        );
+        verify_echo(&new, b"through the relay").await?;
+
+        new.close(0u32.into(), b"done");
+        old.close(0u32.into(), b"done");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
         Ok(())
     }
 }
