@@ -123,6 +123,12 @@ impl TestNetwork {
         self.inner.lock().expect("poisoned").black_holes.insert(id);
     }
 
+    /// ember: drops every packet sent while `dropping` (a transport that is not carrying yet, as Salix's socket
+    /// before it is registered), or carries them again.
+    pub fn set_dropping(&self, dropping: bool) {
+        self.inner.lock().expect("poisoned").dropping = dropping;
+    }
+
     /// ember: carries packets to `id` again after [`Self::black_hole`].
     pub fn mend(&self, id: EndpointId) {
         self.inner.lock().expect("poisoned").black_holes.remove(&id);
@@ -139,6 +145,8 @@ struct TestNetworkInner {
     channels: BTreeMap<EndpointId, (mpsc::Sender<Packet>, mpsc::Receiver<Packet>)>,
     /// ember: endpoints whose packets are lost on the way (`TestNetwork::black_hole`).
     black_holes: std::collections::BTreeSet<EndpointId>,
+    /// ember: every packet is lost (`TestNetwork::set_dropping`).
+    dropping: bool,
 }
 
 impl AddressLookup for TestAddrLookup {
@@ -199,7 +207,7 @@ impl TestSender {
     fn send_sync(&self, dst: &CustomAddr, packets: Vec<Packet>) -> io::Result<()> {
         let to_id = try_parse_custom_addr(dst)?;
         let guard = self.network.inner.lock().expect("poisoned");
-        if guard.black_holes.contains(&to_id) {
+        if guard.dropping || guard.black_holes.contains(&to_id) {
             return Ok(());
         }
         let (s, _) = guard
@@ -371,6 +379,8 @@ mod tests {
         custom_bias: Option<TransportBias>,
         keep_ip: bool,
         relay_map: Option<RelayMap>,
+        /// ember: a path given up 3 s after it goes quiet (heard every second), as the mesh of Comma's sets it.
+        short_path_idle: bool,
     }
 
     impl EndpointConfig {
@@ -386,6 +396,11 @@ mod tests {
 
         fn with_relay(mut self, relay_map: RelayMap) -> Self {
             self.relay_map = Some(relay_map);
+            self
+        }
+
+        fn with_short_path_idle(mut self) -> Self {
+            self.short_path_idle = true;
             self
         }
     }
@@ -413,6 +428,14 @@ mod tests {
         }
         if !config.keep_ip {
             builder = builder.clear_ip_transports();
+        }
+        if config.short_path_idle {
+            builder = builder.transport_config(
+                crate::endpoint::QuicTransportConfig::builder()
+                    .default_path_keep_alive_interval(Duration::from_secs(1))
+                    .default_path_max_idle_timeout(Duration::from_secs(3))
+                    .build(),
+            );
         }
         builder
     }
@@ -646,6 +669,168 @@ mod tests {
         }
 
         verify_echo(&conn, b"custom after ip").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// Waits until `done` holds, at most `secs` seconds.
+    async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// ember: the endpoints of a test of a custom transport that does not carry yet: IP and the custom transport, the
+    /// custom one preferred, paths given up 3 s after they go quiet (as in Comma's mesh).
+    async fn custom_later_endpoints(network: &TestNetwork) -> Result<(Endpoint, Endpoint, Router, SecretKey)> {
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+        let custom_bias = TransportBias::primary().with_rtt_advantage(Duration::from_secs(10));
+        let config = EndpointConfig::default()
+            .with_ip()
+            .with_custom_bias(custom_bias)
+            .with_short_path_idle();
+        let ep1 = endpoint_builder(s1, t1, config.clone()).bind().await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+        Ok((ep1, ep2, router, s2))
+    }
+
+    /// ember: waits until the connection's tries to open a custom path are over and the last one is given up (a path
+    /// never validated is given up when its validation times out, about 3 s).
+    async fn custom_tries_over(conn: &crate::endpoint::Connection, tries: u32) {
+        until(60, &format!("the connection's tries were not over: {} tries", conn.custom_path_tries()), || {
+            conn.custom_path_tries() == tries && conn.custom_paths_opening() == 0
+        })
+        .await;
+    }
+
+    /// ember: a custom transport that never answers costs a connection 1 + `CUSTOM_PATH_TRIES` (2) path ids, however
+    /// often it is asked to try (an address resolved again, another connection dialed), and dialing the remote again
+    /// costs nothing more on a connection whose tries are over: the new connection has tries of its own.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_custom_path_tries_bounded_per_connection() -> Result<()> {
+        let network = TestNetwork::new();
+        let (ep1, ep2, router, s2) = custom_later_endpoints(&network).await?;
+        let addr = mixed_addr(&ep2, s2.public());
+
+        network.set_dropping(true);
+        let first = ep1.connect(addr.clone(), ECHO_ALPN).await?;
+        // Asked again and again while it tries (each an address resolved).
+        for _ in 0..40 {
+            ep1.inner().anyerr()?.resolve_remote(addr.clone()).await.anyerr()?.anyerr()?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        custom_tries_over(&first, 3).await;
+        assert_eq!(first.custom_paths_lost(), 3);
+        for dial in 1..=2 {
+            let other = ep1.connect(addr.clone(), ECHO_ALPN).await?;
+            custom_tries_over(&other, 3).await;
+            assert_eq!(first.custom_path_tries(), 3, "dial {dial} made the first connection try again");
+            other.close(0u32.into(), b"done");
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(first.custom_path_tries(), 3, "the first connection tried again");
+        assert_eq!(first.custom_paths_lost(), 3);
+
+        verify_echo(&first, b"ip after the tries").await?;
+        first.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// ember: a custom transport that starts to carry 1, 5 or 12 s after the dial (Salix's socket registered late), the
+    /// remote's address resolved again every 100 ms meanwhile: the connection ends up on it each time. A try lasts until
+    /// its path is given up (about 3 s), so the later ones are made on new tries (at about 3 and 14 s), which the
+    /// resolves must not have used up. One that carries only after the tries are over (about 17 s) is not tried again
+    /// until an event (`test_custom_path_tried_again_on_a_major_network_change`): a known limit.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_custom_path_opened_when_the_transport_carries_late() -> Result<()> {
+        for late_ms in [1_000u64, 5_000, 12_000] {
+            let network = TestNetwork::new();
+            let (ep1, ep2, router, s2) = custom_later_endpoints(&network).await?;
+            let addr = mixed_addr(&ep2, s2.public());
+            network.set_dropping(true);
+            let conn = ep1.connect(addr.clone(), ECHO_ALPN).await?;
+            let carries = tokio::time::Instant::now() + Duration::from_millis(late_ms);
+            while tokio::time::Instant::now() < carries {
+                ep1.inner().anyerr()?.resolve_remote(addr.clone()).await.anyerr()?.anyerr()?;
+                tokio::time::sleep(Duration::from_millis(100).min(carries - tokio::time::Instant::now())).await;
+            }
+            network.set_dropping(false);
+            until(15, &format!("not on the custom transport after it carried {late_ms} ms late: {:?}", conn.paths()), || {
+                is_custom_selected(&conn)
+            })
+            .await;
+            assert!(conn.custom_path_tries() <= 3, "{} tries", conn.custom_path_tries());
+            verify_echo(&conn, b"custom late").await?;
+            conn.close(0u32.into(), b"done");
+            router.shutdown().await.anyerr()?;
+        }
+        Ok(())
+    }
+
+    /// ember: a connection whose tries to open a custom path are over (the custom transport dropped everything: it
+    /// carries only after about 17 s) is not tried again without an event and loses no more path ids, and is tried once
+    /// more when the network changes (major): then the custom path opens and is selected.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_custom_path_tried_again_on_a_major_network_change() -> Result<()> {
+        let network = TestNetwork::new();
+        let (ep1, ep2, router, s2) = custom_later_endpoints(&network).await?;
+        network.set_dropping(true);
+        let conn = ep1.connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN).await?;
+        custom_tries_over(&conn, 3).await;
+        network.set_dropping(false);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!is_custom_selected(&conn), "tried again without an event: {:?}", conn.paths());
+        assert_eq!((conn.custom_path_tries(), conn.custom_paths_lost()), (3, 3), "tried again without an event");
+
+        ep1.inner().anyerr()?.force_network_change(true).await;
+        until(10, &format!("the custom path was not tried again on the network change: {:?}", conn.paths()), || {
+            is_custom_selected(&conn)
+        })
+        .await;
+        verify_echo(&conn, b"custom after network change").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// ember: however many times the network changes (major) while a custom transport never answers, a connection loses
+    /// at most `CUSTOM_PATH_LOST_MAX` (4) path ids to it: after ten changes it can still open another path.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_custom_path_ids_lost_bounded_across_network_changes() -> Result<()> {
+        let network = TestNetwork::new();
+        let (ep1, ep2, router, s2) = custom_later_endpoints(&network).await?;
+        network.set_dropping(true);
+        let conn = ep1.connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN).await?;
+        custom_tries_over(&conn, 3).await;
+        for change in 1..=10 {
+            ep1.inner().anyerr()?.force_network_change(true).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            until(10, "a try in flight was not given up", || conn.custom_paths_opening() == 0).await;
+            assert!(conn.custom_paths_lost() <= 4, "{} ids lost after change {change}", conn.custom_paths_lost());
+        }
+        assert_eq!(conn.custom_paths_lost(), 4);
+        let ip = conn
+            .paths()
+            .iter()
+            .find_map(|p| match p.remote_addr() {
+                TransportAddr::Ip(addr) => Some(*addr),
+                _ => None,
+            })
+            .expect("an IP path");
+        assert!(conn.open_another_path(ip).await, "no path id left: {:?}", conn.paths());
+        verify_echo(&conn, b"ip after the changes").await?;
         conn.close(0u32.into(), b"done");
         router.shutdown().await.anyerr()?;
         Ok(())
