@@ -134,6 +134,8 @@ struct Shared {
     notify: Notify,
     /// ember: the connection's tries to open a custom path that left one missing (`RemoteStateActor::open_custom_paths`).
     custom_tries: std::sync::atomic::AtomicU32,
+    /// ember: the connection's custom paths being opened still (not yet established or abandoned).
+    custom_opening: std::sync::atomic::AtomicU32,
 }
 
 /// The writer-side handle for a connection's path state.
@@ -160,6 +162,7 @@ impl PathStateSender {
             state: Default::default(),
             notify: Notify::new(),
             custom_tries: Default::default(),
+            custom_opening: Default::default(),
         });
         let receiver = PathStateReceiver {
             shared: shared.clone(),
@@ -174,6 +177,13 @@ impl PathStateSender {
         self.shared
             .custom_tries
             .store(tries, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// ember: records how many of the connection's custom paths are being opened still.
+    pub(super) fn record_custom_opening(&self, opening: usize) {
+        self.shared
+            .custom_opening
+            .store(opening as u32, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records a newly-opened path and emits [`PathEvent::Opened`].
@@ -329,6 +339,14 @@ impl PathStateReceiver {
     pub(crate) fn custom_tries(&self) -> u32 {
         self.shared
             .custom_tries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// ember: the connection's custom paths being opened still, for tests.
+    #[cfg(test)]
+    pub(crate) fn custom_opening(&self) -> u32 {
+        self.shared
+            .custom_opening
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

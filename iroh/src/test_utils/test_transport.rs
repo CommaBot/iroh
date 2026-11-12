@@ -739,7 +739,7 @@ mod tests {
     /// remote's address resolved again every 100 ms meanwhile: the connection ends up on it each time. A try lasts until
     /// its path is given up (3 s quiet), so the later ones are made on new tries, which the resolves must not have used
     /// up. One that carries only after all the tries are over (about 20 s with the waits between tries a twentieth as
-    /// long in tests; about a minute in a build) is not tried again until an event: a known limit.
+    /// long in tests; about 93 s in a build) is not tried again until an event: a known limit.
     #[tokio::test]
     #[traced_test]
     async fn test_custom_path_opened_when_the_transport_carries_late() -> Result<()> {
@@ -777,9 +777,12 @@ mod tests {
         let (ep1, ep2, router, s2) = custom_later_endpoints(&network).await?;
         network.set_dropping(true);
         let conn = ep1.connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN).await?;
-        until(60, "the connection's tries were not over", || conn.custom_path_tries() == 6).await;
-        // The last try is given up 3 s after it goes quiet.
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        // Over once the last try's path is given up too: one never validated is given up when its validation times
+        // out (about 3 s), however short the path idle timeout.
+        until(60, "the connection's tries were not over", || {
+            conn.custom_path_tries() == 6 && conn.custom_paths_opening() == 0
+        })
+        .await;
         network.set_dropping(false);
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!is_custom_selected(&conn), "tried again without an event: {:?}", conn.paths());

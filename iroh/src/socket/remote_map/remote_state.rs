@@ -78,12 +78,16 @@ const CUSTOM_PATH_RETRY_MAX: Duration = Duration::from_secs(30);
 const CUSTOM_PATH_RETRY: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const CUSTOM_PATH_RETRY_MAX: Duration = Duration::from_millis(1500);
-/// ember: how many times a connection tries again after its first try (the timer's: after 2, 4, 8, 16 and 30 s, about a
-/// minute) before it stops until a custom path opens on it, the remote's custom addresses change or the network changes
-/// (major). A try is counted
-/// whatever asked for it (the timer, an address lookup that found nothing new, another dial): each one that fails takes
-/// one of the connection's path ids, which the remote never gives back for a path it did not see, and a custom transport
-/// that never answers must not use up the ids a direct path needs later.
+/// ember: how many times a connection tries again after its first try (the timer's: after 2, 4, 8, 16 and 30 s; the
+/// last about 90 s after the first) before it stops until a custom path opens on it, the remote's custom addresses
+/// change or the network changes (major). A try is counted whatever asked for it (the timer, an address lookup that
+/// found nothing new, another dial): each one that fails takes one of the connection's path ids, which the remote never
+/// gives back for a path it did not see, and a custom transport that never answers must not use up the ids a direct
+/// path needs later.
+///
+/// Measured with paths given up 3 s after they go quiet (as in Comma's mesh): a try that fails is given up after about
+/// 3.1 s; the tries opened new path ids at 0, 3.2, 13.9, 29.9, 59.9 and 89.9 s (the 2 s wait ended while the first was
+/// in flight and took no new one), and the last was given up at 93 s.
 const CUSTOM_PATH_TRIES: u32 = 5;
 
 /// ember: how often the path is chosen again from its connections' paths' RTTs. Chosen only as a path opened, was
@@ -605,6 +609,7 @@ impl RemoteStateActor {
                     && !conn_state.custom_opening.contains(&path_id)
                 {
                     conn_state.custom_opening.push(path_id);
+                    conn_state.path_state.record_custom_opening(conn_state.custom_opening.len());
                     conn_state.custom_tries += 1;
                     conn_state.path_state.record_custom_tries(conn_state.custom_tries);
                 }
@@ -773,6 +778,7 @@ impl RemoteStateActor {
                     .register_and_configure_path(conn_id, conn_state, &path);
                 // ember: a custom path that opens: a later one missing is tried for soon again.
                 conn_state.custom_opening.retain(|id| *id != path_id);
+                conn_state.path_state.record_custom_opening(conn_state.custom_opening.len());
                 if opened.is_some_and(|open| matches!(open.remote(), transports::Addr::Custom(_))) {
                     self.state.custom_retry = CUSTOM_PATH_RETRY;
                     conn_state.custom_tries = 0;
@@ -782,6 +788,7 @@ impl RemoteStateActor {
             }
             NoqPathEvent::Abandoned { id, reason, .. } => {
                 conn_state.custom_opening.retain(|opening| *opening != id);
+                conn_state.path_state.record_custom_opening(conn_state.custom_opening.len());
                 // Remove abandoned path from the conn state.
                 let Some(network_path) = conn_state.remove_path(&id, &conn) else {
                     debug!(%id, "path not in path_id_map");

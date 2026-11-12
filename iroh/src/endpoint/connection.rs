@@ -1152,6 +1152,12 @@ impl Connection<HandshakeCompleted> {
         self.data.paths.custom_tries()
     }
 
+    /// ember: how many of this connection's paths to a custom transport address are being opened still.
+    #[cfg(test)]
+    pub(crate) fn custom_paths_opening(&self) -> u32 {
+        self.data.paths.custom_opening()
+    }
+
     /// Returns a stream of [`PathList`] snapshots for this connection.
     ///
     /// Yields the current snapshot on the first poll, and a fresh
