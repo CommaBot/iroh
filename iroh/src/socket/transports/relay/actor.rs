@@ -40,7 +40,7 @@ use std::{
 use backon::{Backoff, BackoffBuilder, ExponentialBuilder};
 use iroh_base::{EndpointId, RelayUrl, SecretKey};
 use iroh_relay::{
-    self as relay, PingTracker, RelayMap,
+    self as relay, PingTracker, RelayConfig, RelayMap,
     client::{Client, ConnectError, RecvError, SendError},
     protos::relay::{ClientToRelayMsg, Datagrams, RelayToClientMsg, Status},
 };
@@ -1134,6 +1134,12 @@ pub(super) enum RelayActorMessage {
     NetworkChange {
         report: Report,
     },
+    /// ember: the relay removed from the endpoint (`Endpoint::remove_relay`): out of this actor's map and its excludes,
+    /// its connection to it ended at once, and its home chosen again where it was that relay.
+    RemoveRelay(RelayUrl),
+    /// ember: a relay inserted into the endpoint (`Endpoint::insert_relay`): the one this actor was bound to be home on
+    /// is its again (or another transport's excluded again), and an actor with no home takes it as its home.
+    InsertRelay(RelayUrl, Arc<RelayConfig>),
     /// Trigger an immediate health check on all relay connections.
     ///
     /// Sent after a major network change to detect broken connections faster
@@ -1185,9 +1191,19 @@ pub(crate) struct Config {
     pub relay_map: RelayMap,
     /// ember: relays of `relay_map` this actor is not home on, another relay transport's
     /// (`Builder::home_on_every_relay`: the first transport has the endpoint's whole map, relays inserted later with it,
-    /// the others one relay each).
-    pub excludes: Vec<RelayUrl>,
+    /// the others one relay each). Shared with the transport's sender (`RelaySender::owns`): a relay removed from the
+    /// endpoint is taken out of it, and put back as it is inserted again (`RelayActorMessage::InsertRelay`).
+    pub excludes: Excludes,
+    /// ember: the relay this actor was bound to be home on, where it is one of `Builder::home_on_every_relay`'s
+    /// transports but the first: inserted again after it was removed, it is this actor's again.
+    pub own: Option<RelayUrl>,
+    /// ember: the relays the other transports were bound to be home on (the first transport's): inserted again after
+    /// they were removed, they are excluded here again.
+    pub others: Vec<RelayUrl>,
 }
+
+/// ember: the relays a relay transport is not home on (`Config::excludes`), as its actor and its sender share them.
+pub(crate) type Excludes = Arc<std::sync::RwLock<Vec<RelayUrl>>>;
 
 /// Connection state of the home relay.
 ///
@@ -1451,6 +1467,68 @@ impl RelayActor {
             RelayActorMessage::CheckConnectionAfterNetworkChange => {
                 self.check_connection_after_network_change().await;
             }
+            RelayActorMessage::RemoveRelay(url) => {
+                self.remove_relay(url).await;
+            }
+            RelayActorMessage::InsertRelay(url, config) => {
+                self.insert_relay(url, config).await;
+            }
+        }
+    }
+
+    /// ember: `url` removed from the endpoint. Upstream only took it out of the endpoint's map, which the relay
+    /// transports of `Builder::home_on_every_relay` but the first do not share: they stayed connected to it, home on
+    /// it, and the endpoint's address went on naming it. Here every actor takes it out of its map and its excludes,
+    /// ends its connection to it at once, and chooses its home again where it was that relay.
+    async fn remove_relay(&mut self, url: RelayUrl) {
+        self.config.relay_map.remove(&url);
+        self.config
+            .excludes
+            .write()
+            .expect("poisoned")
+            .retain(|u| u != &url);
+        if let Some(handle) = self.active_relays.remove(&url) {
+            info!(%url, "relay removed: its connection ended");
+            handle.stop.cancel();
+        }
+        let was_home = self
+            .config
+            .my_relay
+            .get()
+            .is_some_and(|status| status.url() == &url);
+        if was_home {
+            self.config.my_relay.clear();
+            if let Some(next) = self.homes().into_iter().next() {
+                info!(home = %next, removed = %url, "home relay removed: home is now another");
+                self.config
+                    .my_relay
+                    .set(next.clone(), RelayConnectionState::Connecting);
+                self.set_home_relay(next).await;
+            }
+        }
+        self.log_active_relay();
+    }
+
+    /// ember: `url` inserted into the endpoint (its map has it already, the first transport's being the endpoint's):
+    /// the relay this actor was bound to be home on is its again, one another transport was is excluded again, and an
+    /// actor home on none takes one it may be home on.
+    async fn insert_relay(&mut self, url: RelayUrl, config: Arc<RelayConfig>) {
+        if self.config.own.as_ref() == Some(&url) {
+            self.config.relay_map.insert(url.clone(), config);
+        } else if self.config.others.contains(&url) {
+            let mut excludes = self.config.excludes.write().expect("poisoned");
+            if !excludes.contains(&url) {
+                excludes.push(url.clone());
+            }
+        }
+        if self.config.my_relay.get().is_none()
+            && let Some(home) = self.homes().into_iter().next()
+        {
+            info!(%home, "relay inserted: home on it");
+            self.config
+                .my_relay
+                .set(home.clone(), RelayConnectionState::Connecting);
+            self.set_home_relay(home).await;
         }
     }
 
@@ -1489,7 +1567,8 @@ impl RelayActor {
     /// (`Config::excludes`).
     fn homes(&self) -> Vec<RelayUrl> {
         let mut urls = self.config.relay_map.urls::<Vec<RelayUrl>>();
-        urls.retain(|u| !self.config.excludes.contains(u));
+        let excludes = self.config.excludes.read().expect("poisoned");
+        urls.retain(|u| !excludes.contains(u));
         urls
     }
 
@@ -1649,6 +1728,7 @@ impl RelayActor {
         let (prio_inbox_tx, prio_inbox_rx) = mpsc::channel(32);
         let (inbox_tx, inbox_rx) = mpsc::channel(64);
         let span = info_span!("active-relay", %url);
+        let stop = self.cancel_token.child_token();
         let opts = ActiveRelayActorOptions {
             url,
             prio_inbox_: prio_inbox_rx,
@@ -1657,7 +1737,7 @@ impl RelayActor {
             relay_datagrams_recv: self.relay_datagram_recv_queue.clone(),
             connection_opts,
             entries,
-            stop_token: self.cancel_token.child_token(),
+            stop_token: stop.clone(),
             metrics: self.config.metrics.clone(),
             my_relay: self.config.my_relay.clone(),
         };
@@ -1670,6 +1750,7 @@ impl RelayActor {
             .instrument(span),
         );
         let handle = ActiveRelayHandle {
+            stop,
             prio_inbox_addr: prio_inbox_tx,
             inbox_addr: inbox_tx,
             datagrams_send_queue: send_datagram_tx,
@@ -1767,6 +1848,8 @@ impl RelayActor {
 /// Handle to one [`ActiveRelayActor`].
 #[derive(Debug, Clone)]
 struct ActiveRelayHandle {
+    /// ember: ends its actor (its relay removed: `RelayActor::remove_relay`).
+    stop: CancellationToken,
     prio_inbox_addr: mpsc::Sender<ActiveRelayPrioMessage>,
     inbox_addr: mpsc::Sender<ActiveRelayMessage>,
     datagrams_send_queue: mpsc::Sender<RelaySendItem>,

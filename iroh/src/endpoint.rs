@@ -1224,7 +1224,10 @@ impl Endpoint {
             "connecting",
         );
 
-        let mapped_addr = self.inner.resolve_remote(endpoint_addr).await??;
+        let mapped_addr = self
+            .inner
+            .resolve_remote_disabled(endpoint_addr, options.disabled_relays)
+            .await??;
 
         let transport_config = options
             .transport_config
@@ -1874,6 +1877,7 @@ impl Endpoint {
 pub struct ConnectOptions {
     transport_config: Option<QuicTransportConfig>,
     additional_alpns: Vec<Vec<u8>>,
+    disabled_relays: Option<BTreeSet<RelayUrl>>,
 }
 
 impl ConnectOptions {
@@ -1913,6 +1917,14 @@ impl ConnectOptions {
     /// [ALPN]: https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation
     pub fn with_additional_alpns(mut self, alpns: Vec<Vec<u8>>) -> Self {
         self.additional_alpns = alpns;
+        self
+    }
+
+    /// ember: relays the remote is not to be reached through, whoever names them (the address given, Address
+    /// Lookup): no path to it goes through one. They stay the remote's until a connect says others (an empty set
+    /// lets none be); a connect that says none leaves them as they are.
+    pub fn with_disabled_relays(mut self, relays: impl IntoIterator<Item = RelayUrl>) -> Self {
+        self.disabled_relays = Some(relays.into_iter().collect());
         self
     }
 }
@@ -3154,6 +3166,194 @@ mod tests {
         conn.close(0u8.into(), b"");
         client.close().await;
         let _ = echo.await;
+        Ok(())
+    }
+
+    /// ember: an endpoint on relays alone (no IP, no Address Lookup), home on every relay of `relays`.
+    async fn bind_on_relays(relays: &RelayMap, seed: u64) -> Result<Endpoint> {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        Ok(Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&rng.random()))
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relays.clone()))
+            .home_on_every_relay()
+            .clear_ip_transports()
+            .bind()
+            .await?)
+    }
+
+    /// ember: every connection to `server` taken and held until it ends.
+    fn accepting(server: &Endpoint) -> tokio::task::JoinHandle<()> {
+        let server = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        conn.closed().await;
+                    }
+                });
+            }
+        })
+    }
+
+    /// ember: whether a new endpoint reaches `server` through `relay` alone within `within` (its handshake done).
+    async fn reached_through(
+        relays: &RelayMap,
+        seed: u64,
+        server: EndpointId,
+        relay: &RelayUrl,
+        within: Duration,
+    ) -> Result<bool> {
+        let client = bind_on_relays(relays, seed).await?;
+        let reached = time::timeout(
+            within,
+            client.connect(EndpointAddr::new(server).with_relay_url(relay.clone()), TEST_ALPN),
+        )
+        .await;
+        let ok = matches!(reached, Ok(Ok(_)));
+        if let Ok(Ok(conn)) = reached {
+            conn.close(0u8.into(), b"");
+        }
+        client.close().await;
+        Ok(ok)
+    }
+
+    /// ember: the relays `endpoint` is home on, and those its address names, once `done` holds of them.
+    async fn relays_until(
+        endpoint: &Endpoint,
+        done: impl Fn(&[RelayUrl], &[RelayUrl]) -> bool,
+    ) -> Result<(Vec<RelayUrl>, Vec<RelayUrl>)> {
+        let mut last = (Vec::new(), Vec::new());
+        let found = time::timeout(Duration::from_secs(10), async {
+            loop {
+                let homes: Vec<RelayUrl> = endpoint
+                    .home_relay_status()
+                    .get()
+                    .iter()
+                    .map(|s| s.url().clone())
+                    .collect();
+                let named: Vec<RelayUrl> = endpoint.addr().relay_urls().cloned().collect();
+                if done(&homes, &named) {
+                    return (homes, named);
+                }
+                last = (homes, named);
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        match found {
+            Ok(found) => Ok(found),
+            Err(_) => Ok(last),
+        }
+    }
+
+    /// ember: a relay removed from an endpoint home on every relay (`Builder::home_on_every_relay`) is let go by the
+    /// relay transport home on it, which upstream never told (it took the relay out of the endpoint's map alone, which
+    /// that transport does not share): out of the home relays and of the endpoint's address, the endpoint no longer
+    /// reached through it; inserted again, home and reached through it again.
+    #[tokio::test]
+    #[traced_test]
+    async fn endpoint_home_on_every_relay_remove_relay_lets_it_go() -> Result {
+        let (map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, _relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let server = bind_on_relays(&relays, 1).await?;
+        let _accepting = accepting(&server);
+        let both = |homes: &[RelayUrl], named: &[RelayUrl]| {
+            [&url_a, &url_b].iter().all(|u| homes.contains(u) && named.contains(u))
+        };
+        let (homes, named) = relays_until(&server, both).await?;
+        assert!(both(&homes, &named), "home on both relays at first: {homes:?} {named:?}");
+
+        for (seed, removed) in [(10, url_b.clone()), (20, url_a.clone())] {
+            let kept = if removed == url_a { &url_b } else { &url_a };
+            assert!(
+                reached_through(&relays, seed, server.id(), &removed, Duration::from_secs(10)).await?,
+                "reached through {removed} before it is removed"
+            );
+            server.remove_relay(&removed).await;
+            let gone = |homes: &[RelayUrl], named: &[RelayUrl]| !homes.contains(&removed) && !named.contains(&removed);
+            let (homes, named) = relays_until(&server, gone).await?;
+            assert!(gone(&homes, &named), "{removed} removed: still home on it or named: {homes:?} {named:?}");
+            assert!(homes.contains(kept), "still home on {kept}: {homes:?}");
+            assert!(
+                !reached_through(&relays, seed + 1, server.id(), &removed, Duration::from_secs(5)).await?,
+                "{removed} removed: the endpoint is still reached through it"
+            );
+            assert!(
+                reached_through(&relays, seed + 2, server.id(), kept, Duration::from_secs(10)).await?,
+                "reached through {kept}, which stays"
+            );
+
+            server
+                .insert_relay(removed.clone(), Arc::new(RelayConfig::from(removed.clone())))
+                .await;
+            let back = |homes: &[RelayUrl], named: &[RelayUrl]| homes.contains(&removed) && named.contains(&removed);
+            let (homes, named) = relays_until(&server, back).await?;
+            assert!(back(&homes, &named), "{removed} inserted again: home on it and named: {homes:?} {named:?}");
+            assert!(
+                reached_through(&relays, seed + 3, server.id(), &removed, Duration::from_secs(10)).await?,
+                "{removed} inserted again: reached through it again"
+            );
+        }
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: a relay the remote is not to be reached through (`ConnectOptions::with_disabled_relays`) is no path of
+    /// the connection, though the address given names it (as Address Lookup does, the remote home on it too).
+    #[tokio::test]
+    #[traced_test]
+    async fn endpoint_connect_disabled_relays_are_no_path() -> Result {
+        let (map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, _relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let server = bind_on_relays(&relays, 1).await?;
+        let _accepting = accepting(&server);
+        let both = |homes: &[RelayUrl], named: &[RelayUrl]| {
+            [&url_a, &url_b].iter().all(|u| homes.contains(u) && named.contains(u))
+        };
+        let (homes, named) = relays_until(&server, both).await?;
+        assert!(both(&homes, &named), "home on both relays: {homes:?} {named:?}");
+        // Both disabled one at a time, so that neither the first relay transport's nor another's is the only case.
+        for (seed, disabled) in [(30, url_a.clone()), (40, url_b.clone())] {
+            let allowed = if disabled == url_a { &url_b } else { &url_a };
+            let client = bind_on_relays(&relays, seed).await?;
+            let conn = time::timeout(
+                Duration::from_secs(10),
+                client.connect_with_opts(
+                    server.addr(),
+                    TEST_ALPN,
+                    ConnectOptions::new().with_disabled_relays([disabled.clone()]),
+                ),
+            )
+            .await
+            .anyerr()??
+            .await
+            .anyerr()?;
+            let relayed = || -> Vec<TransportAddr> {
+                conn.paths().iter().filter(|p| p.is_relay()).map(|p| p.remote_addr().clone()).collect()
+            };
+            // Long enough for the relay paths missing to be opened (`RELAY_REOPEN`, a path a relay of the address).
+            let until = time::Instant::now() + Duration::from_secs(4);
+            let mut seen_allowed = false;
+            while time::Instant::now() < until {
+                let now = relayed();
+                info!(?now, %disabled, "client's relay paths");
+                assert!(!now.contains(&TransportAddr::Relay(disabled.clone())), "a path through {disabled}, disabled: {now:?}");
+                seen_allowed |= now.contains(&TransportAddr::Relay(allowed.clone()));
+                time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(seen_allowed, "a path through {allowed}");
+            conn.close(0u8.into(), b"");
+            client.close().await;
+        }
+        server.close().await;
         Ok(())
     }
 

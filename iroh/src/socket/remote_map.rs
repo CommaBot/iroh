@@ -269,8 +269,19 @@ impl RemoteMap {
         addr: EndpointAddr,
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
     ) {
+        self.resolve_remote_disabled(addr, None, tx).await
+    }
+
+    /// ember: as `resolve_remote`, and with the relays the remote is not to be reached through where `disabled` says
+    /// them (`ConnectOptions::with_disabled_relays`).
+    pub(super) async fn resolve_remote_disabled(
+        &mut self,
+        addr: EndpointAddr,
+        disabled: Option<BTreeSet<RelayUrl>>,
+        tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
+    ) {
         let EndpointAddr { id, addrs } = addr;
-        self.send_to_actor(id, RemoteStateMessage::ResolveRemote(addrs, tx))
+        self.send_to_actor(id, RemoteStateMessage::ResolveRemote(addrs, disabled, tx))
             .await
     }
 
@@ -501,7 +512,7 @@ mod tests {
         remote_map
             .send_to_actor(
                 endpoint_id,
-                RemoteStateMessage::ResolveRemote(BTreeSet::new(), ack_tx),
+                RemoteStateMessage::ResolveRemote(BTreeSet::new(), None, ack_tx),
             )
             .await;
         tokio::time::timeout(Duration::from_secs(1), ack_rx)

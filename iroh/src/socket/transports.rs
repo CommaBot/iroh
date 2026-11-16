@@ -246,9 +246,13 @@ impl Transports {
             .enumerate()
             .map(|(i, relay_map)| {
                 let mut config = relay_actor_config.clone();
+                // (each its own: a clone of the config's would be shared by all of them)
                 if i == 0 {
-                    config.excludes = others.clone();
+                    config.excludes = Arc::new(std::sync::RwLock::new(others.clone()));
+                    config.others = others.clone();
                 } else {
+                    config.excludes = Default::default();
+                    config.own = relay_map.urls::<Vec<RelayUrl>>().into_iter().next();
                     config.relay_map = relay_map.clone();
                     config.my_relay = HomeRelayWatch::default();
                 }
@@ -718,6 +722,22 @@ impl NetworkChangeSender {
     pub(crate) fn set_relay_entries(&self, entries: Vec<(RelayUrl, Vec<RelayUrl>)>) {
         for relay in &self.relay {
             relay.set_relay_entries(entries.clone());
+        }
+    }
+
+    /// ember: a relay removed from the endpoint, from every relay transport (`Builder::home_on_every_relay`: each but
+    /// the first has a map of its own, which the endpoint's removal did not reach).
+    pub(crate) fn remove_relay(&self, url: RelayUrl) {
+        for relay in &self.relay {
+            relay.remove_relay(url.clone());
+        }
+    }
+
+    /// ember: a relay inserted into the endpoint, told every relay transport (the one bound to be home on it takes it
+    /// again).
+    pub(crate) fn insert_relay(&self, url: RelayUrl, config: Arc<iroh_relay::RelayConfig>) {
+        for relay in &self.relay {
+            relay.insert_relay(url.clone(), config.clone());
         }
     }
 

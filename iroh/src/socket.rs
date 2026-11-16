@@ -960,7 +960,9 @@ impl EndpointInner {
             tls_config: tls_config.clone(),
             metrics: metrics.socket.clone(),
             relay_map: relay_map.clone(),
-            excludes: Vec::new(),
+            excludes: Default::default(),
+            own: None,
+            others: Vec::new(),
         };
 
         let shutdown_state = ShutdownState::default();
@@ -1270,7 +1272,12 @@ impl EndpointInner {
         relay: RelayUrl,
         endpoint: Arc<RelayConfig>,
     ) -> Option<Arc<RelayConfig>> {
-        let res = self.relay_map.insert(relay, endpoint);
+        let res = self.relay_map.insert(relay.clone(), endpoint.clone());
+        // ember: told every relay transport (`Builder::home_on_every_relay`).
+        self.actor_sender
+            .send(ActorMessage::RelayInserted(relay, endpoint))
+            .await
+            .ok();
         self.actor_sender
             .send(ActorMessage::RelayMapChange)
             .await
@@ -1280,6 +1287,11 @@ impl EndpointInner {
 
     pub(crate) async fn remove_relay(&self, relay: &RelayUrl) -> Option<Arc<RelayConfig>> {
         let res = self.relay_map.remove(relay);
+        // ember: every relay transport ends its connection to it, and stops being home on it.
+        self.actor_sender
+            .send(ActorMessage::RelayRemoved(relay.clone()))
+            .await
+            .ok();
         self.actor_sender
             .send(ActorMessage::RelayMapChange)
             .await
@@ -1383,10 +1395,21 @@ impl EndpointInner {
         addr: EndpointAddr,
     ) -> Result<Result<EndpointIdMappedAddr, AddressLookupFailed>, RemoteStateActorStoppedError>
     {
+        self.resolve_remote_disabled(addr, None).await
+    }
+
+    /// ember: as `resolve_remote`, and with the relays the remote is not to be reached through where `disabled` says
+    /// them (`ConnectOptions::with_disabled_relays`).
+    pub(crate) async fn resolve_remote_disabled(
+        &self,
+        addr: EndpointAddr,
+        disabled: Option<BTreeSet<RelayUrl>>,
+    ) -> Result<Result<EndpointIdMappedAddr, AddressLookupFailed>, RemoteStateActorStoppedError>
+    {
         let (tx, rx) = oneshot::channel();
         let remote_id = addr.id;
         self.actor_sender
-            .send(ActorMessage::ResolveRemote(addr, tx))
+            .send(ActorMessage::ResolveRemote(addr, disabled, tx))
             .await
             .ok();
         let reply = rx.await.map_err(|_| RemoteStateActorStoppedError::new())?;
@@ -1443,6 +1466,7 @@ enum ActorMessage {
     #[debug("ResolveRemote(..)")]
     ResolveRemote(
         EndpointAddr,
+        Option<BTreeSet<RelayUrl>>,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
     ),
     #[debug("AddConnection(..)")]
@@ -1457,6 +1481,11 @@ enum ActorMessage {
     ReconnectRelays,
     /// Forwarding entrances changed, without a change to the relay identities.
     RelayEntriesChange(Vec<(RelayUrl, Vec<RelayUrl>)>),
+    /// ember: a relay removed from the endpoint, told every relay transport.
+    RelayRemoved(RelayUrl),
+    /// ember: a relay inserted into the endpoint, told every relay transport.
+    #[debug("RelayInserted({_0})")]
+    RelayInserted(RelayUrl, Arc<RelayConfig>),
     #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
 }
@@ -1852,8 +1881,16 @@ impl Actor {
             ActorMessage::RelayEntriesChange(entries) => {
                 self.transports_network_change.set_relay_entries(entries);
             }
-            ActorMessage::ResolveRemote(addr, tx) => {
-                self.remote_map.resolve_remote(addr, tx).await;
+            ActorMessage::RelayRemoved(url) => {
+                self.transports_network_change.remove_relay(url);
+            }
+            ActorMessage::RelayInserted(url, config) => {
+                self.transports_network_change.insert_relay(url, config);
+            }
+            ActorMessage::ResolveRemote(addr, disabled, tx) => {
+                self.remote_map
+                    .resolve_remote_disabled(addr, disabled, tx)
+                    .await;
             }
             ActorMessage::AddConnection(remote, conn, tx) => {
                 self.remote_map.add_connection(remote, conn, tx).await;

@@ -21,7 +21,7 @@ use crate::endpoint::RelayStatus;
 
 mod actor;
 
-pub(crate) use self::actor::{Config as RelayActorConfig, HomeRelayWatch, RelayConnectionState};
+pub(crate) use self::actor::{Config as RelayActorConfig, Excludes, HomeRelayWatch, RelayConnectionState};
 use self::actor::{RelayActor, RelayActorMessage, RelayRecvDatagram, RelaySendItem};
 
 type RelayAddrWatcher =
@@ -41,7 +41,7 @@ pub(crate) struct RelayTransport {
     my_endpoint_id: EndpointId,
     /// ember: the relays this transport is the endpoint's way to (`Builder::home_on_every_relay`), but `excludes`.
     relay_map: iroh_relay::RelayMap,
-    excludes: Vec<RelayUrl>,
+    excludes: Excludes,
 }
 
 impl std::fmt::Display for RelayTransport {
@@ -252,6 +252,16 @@ impl RelayNetworkChangeSender {
         self.send_relay_actor(RelayActorMessage::SetEntries(entries));
     }
 
+    /// ember: the relay removed from the endpoint (`RelayActor::remove_relay`).
+    pub(super) fn remove_relay(&self, url: RelayUrl) {
+        self.send_relay_actor(RelayActorMessage::RemoveRelay(url));
+    }
+
+    /// ember: a relay inserted into the endpoint (`RelayActor::insert_relay`).
+    pub(super) fn insert_relay(&self, url: RelayUrl, config: std::sync::Arc<iroh_relay::RelayConfig>) {
+        self.send_relay_actor(RelayActorMessage::InsertRelay(url, config));
+    }
+
     pub(super) fn rebind(&self) -> io::Result<()> {
         self.send_relay_actor(RelayActorMessage::MaybeCloseRelaysOnRebind);
 
@@ -278,7 +288,7 @@ impl RelayNetworkChangeSender {
 pub(crate) struct RelaySender {
     sender: PollSender<RelaySendItem>,
     relay_map: iroh_relay::RelayMap,
-    excludes: Vec<RelayUrl>,
+    excludes: Excludes,
 }
 
 impl RelaySender {
@@ -289,7 +299,7 @@ impl RelaySender {
             Self {
                 sender: PollSender::new(sender),
                 relay_map: iroh_relay::RelayMap::empty(),
-                excludes: Vec::new(),
+                excludes: Default::default(),
             },
             receiver,
         )
@@ -297,7 +307,7 @@ impl RelaySender {
 
     /// ember: whether `url` is one of this transport's relays.
     pub(super) fn owns(&self, url: &RelayUrl) -> bool {
-        self.relay_map.contains(url) && !self.excludes.contains(url)
+        self.relay_map.contains(url) && !self.excludes.read().expect("poisoned").contains(url)
     }
 
     pub(super) fn is_valid_send_addr(&self, _url: &RelayUrl, _endpoint_id: &EndpointId) -> bool {

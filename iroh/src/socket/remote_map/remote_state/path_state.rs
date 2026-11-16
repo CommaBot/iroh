@@ -1,10 +1,11 @@
 //! The state kept for each network path to a remote endpoint.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
+use iroh_base::RelayUrl;
 use n0_error::e;
 use n0_future::time::Instant;
 use rustc_hash::FxHashMap;
@@ -36,6 +37,9 @@ pub(super) struct RemotePathState {
     /// Pending resolve requests from [`Self::resolve_remote`].
     pending_resolve_requests: VecDeque<oneshot::Sender<Result<(), AddressLookupFailed>>>,
     metrics: Arc<SocketMetrics>,
+    /// ember: relays the remote is not to be reached through (`ConnectOptions::with_disabled_relays`): paths through
+    /// them are never kept, whoever named them (the app, Address Lookup).
+    disabled_relays: BTreeSet<RelayUrl>,
 }
 
 /// Describes the usability of this path, i.e. whether it has ever been opened,
@@ -60,7 +64,21 @@ impl RemotePathState {
             paths: Default::default(),
             pending_resolve_requests: Default::default(),
             metrics,
+            disabled_relays: Default::default(),
         }
+    }
+
+    /// ember: the relays the remote is not to be reached through from now on (as the last connect said them): the
+    /// paths known through them are let go.
+    pub(super) fn set_disabled_relays(&mut self, relays: BTreeSet<RelayUrl>) {
+        self.disabled_relays = relays;
+        let disabled = &self.disabled_relays;
+        self.paths.retain(|addr, _| !is_disabled(disabled, addr));
+    }
+
+    /// ember: whether `addr` is a path through a relay the remote is not to be reached through.
+    pub(super) fn is_disabled(&self, addr: &transports::Addr) -> bool {
+        is_disabled(&self.disabled_relays, addr)
     }
 
     pub(super) fn to_remote_addrs(&self) -> Vec<TransportAddrInfo> {
@@ -85,6 +103,9 @@ impl RemotePathState {
     ///
     /// This will emit pending resolve requests and trigger pruning paths.
     pub(super) fn insert_open_path(&mut self, addr: transports::Addr, source: Source) {
+        if self.is_disabled(&addr) {
+            return;
+        }
         match addr {
             transports::Addr::Ip(_) => self.metrics.transport_ip_paths_added.inc(),
             transports::Addr::Relay(_, _) => self.metrics.transport_relay_paths_added.inc(),
@@ -140,6 +161,10 @@ impl RemotePathState {
         let now = Instant::now();
         let was_empty = self.paths.is_empty();
         for addr in addrs {
+            if self.is_disabled(&addr) {
+                trace!(?addr, "a path through a disabled relay: not kept");
+                continue;
+            }
             self.paths
                 .entry(addr)
                 .or_default()
@@ -215,6 +240,11 @@ impl RemotePathState {
     pub(super) fn prune_paths(&mut self) {
         prune_non_relay_paths(&mut self.paths);
     }
+}
+
+/// ember: whether `addr` goes through one of `disabled`.
+fn is_disabled(disabled: &BTreeSet<RelayUrl>, addr: &transports::Addr) -> bool {
+    matches!(addr, transports::Addr::Relay(url, _) if disabled.contains(url))
 }
 
 /// The state of a single path to the remote endpoint.

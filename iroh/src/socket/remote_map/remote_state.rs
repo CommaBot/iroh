@@ -453,7 +453,10 @@ impl RemoteStateActor {
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
             }
-            RemoteStateMessage::ResolveRemote(addrs, tx) => {
+            RemoteStateMessage::ResolveRemote(addrs, disabled, tx) => {
+                if let Some(disabled) = disabled {
+                    self.state.paths.set_disabled_relays(disabled);
+                }
                 self.state.handle_msg_resolve_remote(addrs, tx);
                 self.open_custom_paths();
             }
@@ -1714,9 +1717,12 @@ pub(crate) enum RemoteStateMessage {
     /// Sends back `Ok` immediately if the provided address list is non-empy or we have are
     /// other known paths.  Otherwise sends back `Ok` once Address Lookup produces a result,
     /// or the Address Lookup error if Address Lookup fails or produces no results,
+    ///
+    /// ember: with the relays the remote is not to be reached through, where they are said (they stay as said last).
     #[debug("ResolveRemote(..)")]
     ResolveRemote(
         BTreeSet<TransportAddr>,
+        Option<BTreeSet<RelayUrl>>,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
     ),
     /// Returns information about the remote.
