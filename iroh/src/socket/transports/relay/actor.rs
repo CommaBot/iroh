@@ -760,6 +760,7 @@ impl ActiveRelayActor {
             last_packet_src: None,
             pong_pending: None,
             established: false,
+            same_endpoint_id_connected: false,
             #[cfg(test)]
             test_pong: None,
         };
@@ -822,6 +823,11 @@ impl ActiveRelayActor {
                                 self.my_relay
                                     .set_status(&self.url, RelayConnectionState::Connected);
                                 self.my_relay.set_access(&self.url, self.access.clone());
+                                // What the relay said of this connection before it was home.
+                                self.my_relay.set_same_endpoint_id_connected(
+                                    &self.url,
+                                    state.same_endpoint_id_connected,
+                                );
                             }
                         }
                         ActiveRelayMessage::EntrySamples(samples) => {
@@ -983,6 +989,7 @@ impl ActiveRelayActor {
             RelayToClientMsg::Status(status) => match status {
                 Status::Healthy => {
                     info!("Relay server reports: {status}");
+                    state.same_endpoint_id_connected = false;
                     self.my_relay.set_same_endpoint_id_connected(&self.url, false);
                 }
                 Status::SameEndpointIdConnected => {
@@ -990,6 +997,7 @@ impl ActiveRelayActor {
                         relay = %self.url,
                         "Relay server reports problem: {status}: another endpoint with this endpoint's id (its secret key) connected; this connection is inactive"
                     );
+                    state.same_endpoint_id_connected = true;
                     self.my_relay.set_same_endpoint_id_connected(&self.url, true);
                 }
                 _ => warn!("Relay server reports problem: {status}"),
@@ -1100,6 +1108,10 @@ struct ConnectedRelayState {
     ///
     /// This is set to `true` once a pong was received from the server.
     established: bool,
+    /// ember: the relay said it holds this connection inactive for another of the same endpoint id
+    /// (`Status::SameEndpointIdConnected`), until it said `Healthy`. Kept here as well as in the home relay status,
+    /// which takes it only while this relay is home: one that becomes home later says it then (`SetHomeRelay`).
+    same_endpoint_id_connected: bool,
     #[cfg(test)]
     test_pong: Option<([u8; 8], oneshot::Sender<()>)>,
 }
@@ -1809,6 +1821,32 @@ mod tests {
         relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
         span: tracing::Span,
     ) -> AbortOnDropHandle<()> {
+        start_active_relay_actor_watched(
+            secret_key,
+            stop_token,
+            url,
+            prio_inbox_rx,
+            inbox_rx,
+            relay_datagrams_send,
+            relay_datagrams_recv,
+            span,
+            Default::default(),
+        )
+    }
+
+    /// One whose home relay status is `my_relay`'s.
+    #[allow(clippy::too_many_arguments)]
+    fn start_active_relay_actor_watched(
+        secret_key: SecretKey,
+        stop_token: CancellationToken,
+        url: RelayUrl,
+        prio_inbox_rx: mpsc::Receiver<ActiveRelayPrioMessage>,
+        inbox_rx: mpsc::Receiver<ActiveRelayMessage>,
+        relay_datagrams_send: mpsc::Receiver<RelaySendItem>,
+        relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
+        span: tracing::Span,
+        my_relay: HomeRelayWatch,
+    ) -> AbortOnDropHandle<()> {
         let opts = ActiveRelayActorOptions {
             url,
             entries: Vec::new(),
@@ -1829,7 +1867,7 @@ mod tests {
             },
             stop_token,
             metrics: Default::default(),
-            my_relay: Default::default(),
+            my_relay,
         };
         let task = tokio::spawn(ActiveRelayActor::new(opts).run().instrument(span));
         AbortOnDropHandle::new(task)
@@ -2187,6 +2225,92 @@ mod tests {
         cancel_token.cancel();
         task.await.std_context("wait for task to finish")?;
 
+        Ok(())
+    }
+
+    /// ember: the relay says this connection is inactive (another of its endpoint id connected) before it is the home
+    /// relay (with several relays, home is chosen after the net report): said in the home relay status once it is
+    /// home, not lost with the write the URL guard dropped. The relay says it once.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_same_endpoint_id_connected_before_home_is_said_once_home() -> Result {
+        let (_relay_map, relay_url, _server) = test_utils::run_relay_server().await?;
+        let secret_key = SecretKey::from_bytes(&[3u8; 32]);
+        let watch = HomeRelayWatch::default();
+        let (datagram_recv_tx, _datagram_recv_rx) = mpsc::channel(16);
+        let (_send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
+        let (_prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
+        let (inbox_tx, inbox_rx) = mpsc::channel(16);
+        let cancel_token = CancellationToken::new();
+        let _task = start_active_relay_actor_watched(
+            secret_key.clone(),
+            cancel_token.clone(),
+            relay_url.clone(),
+            prio_inbox_rx,
+            inbox_rx,
+            send_datagram_rx,
+            datagram_recv_tx,
+            info_span!("first"),
+            watch.clone(),
+        );
+        // Connected: it has a local address.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (tx, rx) = oneshot::channel();
+                inbox_tx
+                    .send(ActiveRelayMessage::GetLocalAddr(tx))
+                    .await
+                    .unwrap();
+                if rx.await.unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("first connected")?;
+
+        // Another of the same endpoint id: the relay holds the first inactive and tells it, while it is no home relay.
+        let (other_recv_tx, _other_recv_rx) = mpsc::channel(16);
+        let (_other_send_tx, other_send_rx) = mpsc::channel(16);
+        let (_other_prio_tx, other_prio_rx) = mpsc::channel(8);
+        let (_other_inbox_tx, other_inbox_rx) = mpsc::channel(16);
+        let _other = start_active_relay_actor(
+            secret_key,
+            cancel_token.clone(),
+            relay_url.clone(),
+            other_prio_rx,
+            other_inbox_rx,
+            other_send_rx,
+            other_recv_tx,
+            info_span!("second"),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !logs_contain("this connection is inactive") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("the relay said the first is inactive")?;
+        assert_eq!(watch.get(), None);
+
+        // Made home now, as the RelayActor does: the URL first, then the actor told.
+        watch.set(relay_url.clone(), RelayConnectionState::Connecting);
+        inbox_tx
+            .send(ActiveRelayMessage::SetHomeRelay(true))
+            .await
+            .std_context("set home")?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !watch
+                .get()
+                .is_some_and(|s| s.is_connected() && s.same_endpoint_id_connected())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("said in the home relay status once home")?;
+        cancel_token.cancel();
         Ok(())
     }
 
