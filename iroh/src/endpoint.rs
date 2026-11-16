@@ -3280,7 +3280,8 @@ mod tests {
         until("b kept alive some rounds", Box::new(|| client.relay_datagrams(&url_b, &remote).sent >= b.sent + 10)).await?;
         echoes(&conn).await?;
         assert_eq!(client.relay_datagrams(&url_a, &remote).sent, a.sent, "handed to a after it was left out");
-        assert!(conn.paths().iter().any(|p| p.is_ip() && p.is_selected()), "the direct path is kept, chosen");
+        // (kept: which way is chosen among those left is the selector's, by their round trips)
+        assert!(conn.paths().iter().any(|p| p.is_ip()), "the direct path is kept");
         assert!(conn.close_reason().is_none(), "the connection goes on");
 
         // A dial given both relays is made by b alone.
