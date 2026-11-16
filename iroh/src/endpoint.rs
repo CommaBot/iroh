@@ -3357,6 +3357,101 @@ mod tests {
         Ok(())
     }
 
+    /// review (AFK-surf/monoid#6688): a connection kept (the direct path chosen, a backup path through each of two
+    /// relays) while its remote's relay `a` is disabled by a later connect (`with_disabled_relays`, as a dial made
+    /// after a workspace turned it off says it): does anything more go through `a`? Counted at the relay `a` (what it
+    /// was sent by its clients, the server answering only on paths the client opened), in a second window after one
+    /// that lets what was on its way pass, against the rounds that keep the paths alive through `b`.
+    #[tokio::test]
+    #[traced_test]
+    async fn review_disabled_relays_on_a_connection_kept() -> Result {
+        let (map_a, url_a, relay_a) = run_relay_server().await?;
+        let (map_b, url_b, relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let bind = |seed: u64| {
+            let relays = relays.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::Minimal)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(200))
+                            .build(),
+                    )
+                    .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .expect("an address")
+                    .bind()
+                    .await
+            }
+        };
+        let server = bind(11).await?;
+        let client = bind(10).await?;
+        let _accepting = accepting(&server);
+        let addr = time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server.addr();
+                let urls: Vec<_> = addr.relay_urls().cloned().collect();
+                if urls.contains(&url_a) && urls.contains(&url_b) && addr.ip_addrs().next().is_some() {
+                    return addr;
+                }
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        let through = |conn: &Connection, url: &RelayUrl| conn.paths().iter().any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()));
+        let sent = |r: &iroh_relay::server::Server| r.metrics().server.send_packets_recv.get();
+        let conn = client.connect(addr.clone(), TEST_ALPN).await?;
+        time::timeout(Duration::from_secs(20), async {
+            while !(through(&conn, &url_a)
+                && through(&conn, &url_b)
+                && conn.paths().iter().any(|p| p.is_ip() && p.is_selected())
+                && !conn.paths().iter().any(|p| p.is_relay() && p.is_selected()))
+            {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        // `a` disabled by a dial after (the connection kept stays).
+        let again = client
+            .connect_with_opts(addr, TEST_ALPN, ConnectOptions::new().with_disabled_relays([url_a.clone()]))
+            .await?
+            .await
+            .anyerr()?;
+        let b_from = sent(&relay_b);
+        let a_from = sent(&relay_a);
+        let past = async |n: u64| {
+            time::timeout(Duration::from_secs(30), async {
+                while sent(&relay_b) < b_from + n {
+                    time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .anyerr()
+        };
+        past(10).await?;
+        let a_settled = sent(&relay_a);
+        past(30).await?;
+        let a_after = sent(&relay_a);
+        let kept_through_a = through(&conn, &url_a);
+        let new_through_a = through(&again, &url_a);
+        info!(first_window = a_settled - a_from, second_window = a_after - a_settled, kept_through_a, new_through_a, "relay a after it was disabled");
+        assert!(!new_through_a, "the connection dialed with a disabled has a path through it");
+        assert!(!kept_through_a, "the connection kept still has a path through a, disabled");
+        assert_eq!(a_after, a_settled, "relay a passed datagrams on in the second window, a disabled");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn endpoint_two_relay_only_no_ip() -> Result {
