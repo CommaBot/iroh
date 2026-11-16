@@ -16,7 +16,7 @@ use relay::{RelayNetworkChangeSender, RelaySender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, trace, warn};
 
-use super::{Socket, mapped_addrs::MultipathMappedAddr};
+use super::{Socket, mapped_addrs::MultipathMappedAddr, relay_policy::RelayPolicies};
 use crate::{
     endpoint::RelayStatus,
     metrics::EndpointMetrics,
@@ -60,6 +60,8 @@ pub(crate) struct Transports {
     /// Cache for per-packet recv info, to speed up access
     recv_infos: [RecvInfo; noq_udp::BATCH_SIZE],
     consecutive_total_recv_failures: usize,
+    /// ember: the relays each remote may be reached through, held by every sender made here.
+    relay_policies: RelayPolicies,
 }
 
 /// Combined watcher type for all ip transports
@@ -276,7 +278,13 @@ impl Transports {
             poll_recv_counter: Default::default(),
             recv_infos: Default::default(),
             consecutive_total_recv_failures: 0,
+            relay_policies: RelayPolicies::default(),
         })
+    }
+
+    /// ember: the relays each remote may be reached through (the socket's), for the senders made from now on.
+    pub(crate) fn set_relay_policies(&mut self, policies: RelayPolicies) {
+        self.relay_policies = policies;
     }
 
     pub(crate) fn poll_recv(
@@ -504,6 +512,7 @@ impl Transports {
             relay,
             custom,
             max_transmit_segments,
+            relay_policies: self.relay_policies.clone(),
         }
     }
 
@@ -584,6 +593,7 @@ mod tests {
             poll_recv_counter: 0,
             recv_infos: Default::default(),
             consecutive_total_recv_failures: 0,
+            relay_policies: RelayPolicies::default(),
         }
     }
 
@@ -1198,6 +1208,8 @@ pub(crate) struct TransportsSender {
     relay: Vec<RelaySender>,
     custom: Vec<Arc<dyn CustomSender>>,
     max_transmit_segments: NonZeroUsize,
+    /// ember: a remote's datagrams through a relay its policy does not name are dropped here.
+    relay_policies: RelayPolicies,
 }
 
 impl TransportsSender {
@@ -1231,6 +1243,7 @@ impl TransportsSender {
             relay: vec![sender],
             custom: Vec::new(),
             max_transmit_segments: NonZeroUsize::new(1).unwrap(),
+            relay_policies: RelayPolicies::default(),
         };
         (
             sender,
@@ -1285,13 +1298,23 @@ impl TransportsSender {
                 }
             },
             FourTuple::Relay { url, endpoint_id } => {
+                let TransportsSender { relay, relay_policies, .. } = &mut *self;
+                // ember: none through a relay the remote's policy does not name (`Endpoint::set_remote_relays`):
+                // dropped as data no transport takes, which QUIC counts lost. The policy is read, and the datagram
+                // handed on, under one read of it (`set` waits for it, never the other way): once a policy is set, no
+                // datagram is handed on by the one before. A send that is pending is looked at anew when polled again.
+                let policy = relay_policies.read();
+                if !RelayPolicies::allows_in(&policy, endpoint_id, url) {
+                    relay_policies.counted(url, endpoint_id, false);
+                    trace!(%network_path, "relay not allowed for this remote: dropped");
+                    return Poll::Ready(Ok(()));
+                }
                 let mut has_valid_sender = false;
                 // ember: through the relay transport whose relay it is (its connection to that relay is the one the
                 // relay knows this endpoint by: another opened beside it would take its place there), else the first
                 // (whose map is the endpoint's: any relay not another's).
-                let owner = self.relay.iter().position(|s| s.owns(url)).unwrap_or(0);
-                for sender in self
-                    .relay
+                let owner = relay.iter().position(|s| s.owns(url)).unwrap_or(0);
+                for sender in relay
                     .iter_mut()
                     .skip(owner)
                     .take(1)
@@ -1300,9 +1323,15 @@ impl TransportsSender {
                     has_valid_sender = true;
                     match sender.poll_send(cx, url.clone(), *endpoint_id, transmit) {
                         Poll::Pending => {}
-                        Poll::Ready(res) => return Poll::Ready(res),
+                        Poll::Ready(res) => {
+                            if res.is_ok() {
+                                relay_policies.counted(url, endpoint_id, true);
+                            }
+                            return Poll::Ready(res);
+                        }
                     }
                 }
+                drop(policy);
                 if has_valid_sender {
                     return Poll::Pending;
                 }

@@ -266,6 +266,11 @@
 #![cfg_attr(iroh_docsrs, feature(doc_cfg))]
 
 mod socket;
+
+/// ember: what was handed to a relay transport for a remote through one relay, and what its relay policy dropped
+/// (`Endpoint::relay_datagrams`).
+#[cfg(any(test, feature = "test-utils"))]
+pub use socket::relay_policy::RelayDatagrams;
 pub mod tls;
 
 pub(crate) mod portmapper;

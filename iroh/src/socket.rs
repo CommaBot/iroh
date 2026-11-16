@@ -91,6 +91,7 @@ mod metrics;
 pub(crate) mod biased_rtt_path_selector;
 pub(crate) mod concurrent_read_map;
 pub(crate) mod mapped_addrs;
+pub(crate) mod relay_policy;
 pub(crate) mod remote_map;
 pub(crate) mod transports;
 
@@ -348,6 +349,8 @@ impl ShutdownState {
 /// possible.
 #[derive(Debug)]
 pub(crate) struct Socket {
+    /// ember: the relays each remote may be reached through (`Endpoint::set_remote_relays`).
+    relay_policies: relay_policy::RelayPolicies,
     /// Read-only view of the per-remote `RemoteStateActor` inboxes.
     ///
     /// Lets callers send to an existing `RemoteStateActor` without going through
@@ -966,13 +969,16 @@ impl EndpointInner {
         let shutdown_state = ShutdownState::default();
         let shutdown_token = shutdown_state.at_endpoint_closed.child_token();
 
-        let transports = Transports::bind(
+        let mut transports = Transports::bind(
             &transport_configs,
             relay_actor_config,
             &metrics,
             shutdown_token.child_token(),
         )
         .map_err(|err| e!(BindError::Sockets, err))?;
+        // ember: the relays each remote may be reached through (`Endpoint::set_remote_relays`).
+        let relay_policies = relay_policy::RelayPolicies::default();
+        transports.set_relay_policies(relay_policies.clone());
 
         if let Some(v4_port) = transports.local_addrs().into_iter().find_map(|t| {
             if let transports::Addr::Ip(SocketAddr::V4(addr)) = t {
@@ -1012,6 +1018,7 @@ impl EndpointInner {
                 path_selector,
                 span.clone(),
                 relay_maps.len() > 1,
+                relay_policies.clone(),
             )
         };
 
@@ -1019,6 +1026,7 @@ impl EndpointInner {
 
         let sock = Arc::new(Socket {
             remote_actors: remote_map.senders(),
+            relay_policies,
             shutdown: shutdown_state,
             ipv6_reported,
             mapped_addrs: remote_map.mapped_addrs.clone(),
@@ -1396,6 +1404,24 @@ impl EndpointInner {
         }
     }
 
+    /// ember: the relays `remote` may be reached through (`None`: any), in force once this resolves: what is sent it
+    /// through another from then on is dropped (`TransportsSender::poll_send`), and its actor has given up every
+    /// address, path and path being opened through another (`RemoteStateActor::apply_relay_policy`). What was handed
+    /// to a relay transport before is not called back.
+    pub(crate) async fn set_remote_relays(&self, remote: EndpointId, relays: Option<BTreeSet<RelayUrl>>) {
+        self.relay_policies.set(remote, relays);
+        let (tx, rx) = oneshot::channel();
+        if self.actor_sender.send(ActorMessage::RelayPolicy(remote, tx)).await.is_ok() {
+            rx.await.ok();
+        }
+    }
+
+    /// ember: what was handed to a relay transport for `remote` through `relay`, and dropped by its policy (tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn relay_datagrams(&self, relay: &RelayUrl, remote: &EndpointId) -> relay_policy::RelayDatagrams {
+        self.relay_policies.datagrams(relay, remote)
+    }
+
     /// Fetches the [`RemoteInfo`] about a remote from the `RemoteStateActor`.
     ///
     /// Returns `None` if no actor is running for the remote.
@@ -1457,6 +1483,9 @@ enum ActorMessage {
     ReconnectRelays,
     /// Forwarding entrances changed, without a change to the relay identities.
     RelayEntriesChange(Vec<(RelayUrl, Vec<RelayUrl>)>),
+    /// ember: a remote's relay policy changed: its actor goes by it, then the sender is told.
+    #[debug("RelayPolicy(..)")]
+    RelayPolicy(EndpointId, oneshot::Sender<()>),
     #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
 }
@@ -1857,6 +1886,9 @@ impl Actor {
             }
             ActorMessage::AddConnection(remote, conn, tx) => {
                 self.remote_map.add_connection(remote, conn, tx).await;
+            }
+            ActorMessage::RelayPolicy(remote, tx) => {
+                self.remote_map.apply_relay_policy(remote, tx).await;
             }
             ActorMessage::DirectAddrRefresh => {
                 #[cfg(not(wasm_browser))]

@@ -178,6 +178,11 @@ impl RemotePathState {
         self.emit_pending_resolve_requests(result.err());
     }
 
+    /// ember: keeps the addresses `keep` says, the others forgotten (a relay policy, `Endpoint::set_remote_relays`).
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&transports::Addr) -> bool) {
+        self.paths.retain(|addr, _| keep(addr));
+    }
+
     /// Returns an iterator over the addresses of all paths.
     pub(super) fn addrs(&self) -> impl Iterator<Item = &transports::Addr> {
         self.paths.keys()

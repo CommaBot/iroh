@@ -35,6 +35,7 @@ use super::{
     },
     transports,
 };
+use super::relay_policy::RelayPolicies;
 use crate::{
     address_lookup::{self, AddressLookupFailed},
     socket::concurrent_read_map::{ConcurrentReadMap, ReadOnlyMap},
@@ -149,6 +150,8 @@ struct Tasks {
     path_selector: Arc<dyn PathSelector>,
     /// ember: whether the endpoint is home on several relays (`Builder::home_on_every_relay`).
     several_relays: bool,
+    /// ember: the relays each remote may be reached through (`Endpoint::set_remote_relays`).
+    relay_policies: RelayPolicies,
     /// The tracing span for this endpoint, to be used as parent span for `RemoteStateActor` tasks.
     span: Span,
 }
@@ -163,6 +166,7 @@ impl RemoteMap {
         path_selector: Arc<dyn PathSelector>,
         span: Span,
         several_relays: bool,
+        relay_policies: RelayPolicies,
     ) -> Self {
         Self {
             mapped_addrs: Default::default(),
@@ -176,6 +180,7 @@ impl RemoteMap {
                 poll_cleanup_waker: None,
                 path_selector,
                 several_relays,
+                relay_policies,
                 span,
             },
         }
@@ -314,6 +319,17 @@ impl RemoteMap {
         }
     }
 
+    /// ember: has `remote`'s actor go by its relay policy now (`Endpoint::set_remote_relays`), `done` told once it
+    /// did: none of its addresses, paths or paths being opened through a relay the policy does not name are left. A
+    /// remote with no actor running has nothing to give up (one started later goes by the policy from its start).
+    pub(super) async fn apply_relay_policy(&mut self, remote: EndpointId, done: oneshot::Sender<()>) {
+        if self.senders.read_only().get(&remote).is_none() {
+            done.send(()).ok();
+            return;
+        }
+        self.send_to_actor(remote, RemoteStateMessage::ApplyRelayPolicy(done)).await;
+    }
+
     pub(super) fn senders(&self) -> ReadOnlyMap<EndpointId, mpsc::Sender<RemoteStateMessage>> {
         self.senders.read_only()
     }
@@ -340,6 +356,7 @@ impl Tasks {
             self.address_lookup.clone(),
             self.path_selector.clone(),
             self.several_relays,
+            self.relay_policies.clone(),
         )
         .start(
             initial_msgs,
@@ -526,6 +543,7 @@ mod tests {
             Arc::new(BiasedRttPathSelector::default()),
             Span::none(),
             false,
+            RelayPolicies::default(),
         );
         let guards = (watchable, shutdown_token.clone().drop_guard());
         (remote_map, shutdown_token, guards)
