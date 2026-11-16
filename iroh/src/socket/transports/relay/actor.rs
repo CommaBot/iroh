@@ -567,7 +567,11 @@ impl ActiveRelayActor {
                 .instrument(info_span!("connected"))
                 .await?
             {
-                Some(next) => client = next,
+                Some(next) => {
+                    // A connection made anew (another entrance): the relay takes it as the active one.
+                    self.my_relay.set_same_endpoint_id_connected(&self.url, false);
+                    client = next
+                }
                 None => return Ok(()),
             }
         }
@@ -977,7 +981,17 @@ impl ActiveRelayActor {
                 state.established = true;
             }
             RelayToClientMsg::Status(status) => match status {
-                Status::Healthy => info!("Relay server reports: {status}"),
+                Status::Healthy => {
+                    info!("Relay server reports: {status}");
+                    self.my_relay.set_same_endpoint_id_connected(&self.url, false);
+                }
+                Status::SameEndpointIdConnected => {
+                    warn!(
+                        relay = %self.url,
+                        "Relay server reports problem: {status}: another endpoint with this endpoint's id (its secret key) connected; this connection is inactive"
+                    );
+                    self.my_relay.set_same_endpoint_id_connected(&self.url, true);
+                }
                 _ => warn!("Relay server reports problem: {status}"),
             },
             RelayToClientMsg::Restarting { .. } => {
@@ -1274,6 +1288,20 @@ impl HomeRelayWatch {
     fn set_access(&self, url: &RelayUrl, access: RelayUrl) {
         if let Some(current) = self.inner.get().filter(|s| s.url() == url) {
             let _ = self.inner.set(Some(current.with_access(access)));
+        }
+    }
+
+    /// ember: whether the relay holds this connection inactive for another of the same endpoint id, while `url` is
+    /// still the home relay (as `set_status`).
+    fn set_same_endpoint_id_connected(&self, url: &RelayUrl, same: bool) {
+        if let Some(current) = self
+            .inner
+            .get()
+            .filter(|s| s.url() == url && s.same_endpoint_id_connected() != same)
+        {
+            let _ = self
+                .inner
+                .set(Some(current.with_same_endpoint_id_connected(same)));
         }
     }
 
@@ -2300,5 +2328,33 @@ mod tests {
             watch.get(),
             Some(RelayStatus::new(b, RelayConnectionState::Connected)),
         );
+    }
+
+    #[test]
+    fn test_home_relay_watch_same_endpoint_id_connected() {
+        use super::{HomeRelayWatch, RelayConnectionState};
+
+        let watch = HomeRelayWatch::default();
+        let a: RelayUrl = "https://a.example.com".parse().unwrap();
+        let b: RelayUrl = "https://b.example.com".parse().unwrap();
+        watch.set(a.clone(), RelayConnectionState::Connecting);
+        watch.set_status(&a, RelayConnectionState::Connected);
+        assert!(!watch.get().unwrap().same_endpoint_id_connected());
+
+        // The relay holds this connection inactive: said, the state kept.
+        watch.set_same_endpoint_id_connected(&a, true);
+        let status = watch.get().unwrap();
+        assert!(status.same_endpoint_id_connected());
+        assert!(status.is_connected());
+        // Not for a relay that is no longer home.
+        watch.set_same_endpoint_id_connected(&b, false);
+        assert!(watch.get().unwrap().same_endpoint_id_connected());
+        // Healthy again: cleared.
+        watch.set_same_endpoint_id_connected(&a, false);
+        assert!(!watch.get().unwrap().same_endpoint_id_connected());
+        // A connection made anew clears it too.
+        watch.set_same_endpoint_id_connected(&a, true);
+        watch.set_status(&a, RelayConnectionState::Disconnected { last_error: None });
+        assert!(!watch.get().unwrap().same_endpoint_id_connected());
     }
 }

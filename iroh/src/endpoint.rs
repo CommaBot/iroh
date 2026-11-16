@@ -1999,6 +1999,10 @@ pub struct RelayStatus {
     url: RelayUrl,
     state: RelayConnectionState,
     access: RelayUrl,
+    /// ember: the relay said another client with this endpoint's id (its secret key) connected after this one, which
+    /// it now holds inactive (`Status::SameEndpointIdConnected`); until it says `Healthy` or this connection is made
+    /// anew.
+    same_endpoint_id_connected: bool,
 }
 
 impl RelayStatus {
@@ -2007,6 +2011,7 @@ impl RelayStatus {
             access: url.clone(),
             url,
             state,
+            same_endpoint_id_connected: false,
         }
     }
 
@@ -2022,6 +2027,19 @@ impl RelayStatus {
 
     pub(crate) fn with_access(mut self, access: RelayUrl) -> Self {
         self.access = access;
+        self
+    }
+
+    /// Whether the relay holds this connection inactive because another endpoint with the same id (the same secret
+    /// key) connected after it: two processes, or two machines, run one endpoint, and the relay sends each peer's
+    /// packets to the other one only. Cleared when the relay says this connection is healthy again (the other one
+    /// left) or this connection is made anew.
+    pub fn same_endpoint_id_connected(&self) -> bool {
+        self.same_endpoint_id_connected
+    }
+
+    pub(crate) fn with_same_endpoint_id_connected(mut self, same: bool) -> Self {
+        self.same_endpoint_id_connected = same;
         self
     }
 
@@ -2194,6 +2212,56 @@ mod tests {
             }
         );
 
+        Ok(())
+    }
+
+    /// ember: two endpoints of one secret key on one relay (a second process, or another machine, with a copy of the
+    /// key): the relay holds the first inactive and says so, which its home relay status says until the second leaves
+    /// and the relay says it is healthy again.
+    #[tokio::test]
+    #[traced_test]
+    async fn same_endpoint_id_connected_is_in_the_home_relay_status_until_healthy() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7u64);
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        let key = SecretKey::from_bytes(&rng.random());
+        let bind = |key: SecretKey| {
+            Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Custom(relay_map.clone()))
+                .secret_key(key)
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .clear_ip_transports()
+                .bind()
+        };
+        let first = bind(key.clone()).await?;
+        first.online().await;
+        let mut status = first.home_relay_status();
+        assert!(status.get().iter().all(|s| !s.same_endpoint_id_connected()));
+        let second = bind(key).await?;
+        second.online().await;
+        time::timeout(Duration::from_secs(20), async {
+            while !status.get().iter().any(|s| s.same_endpoint_id_connected()) {
+                status.updated().await.expect("watch remains open");
+            }
+        })
+        .await
+        .anyerr()?;
+        assert!(
+            second
+                .home_relay_status()
+                .get()
+                .iter()
+                .all(|s| !s.same_endpoint_id_connected()),
+            "the one connected last is the active one"
+        );
+        second.close().await;
+        time::timeout(Duration::from_secs(20), async {
+            while status.get().iter().any(|s| s.same_endpoint_id_connected()) {
+                status.updated().await.expect("watch remains open");
+            }
+        })
+        .await
+        .anyerr()?;
+        first.close().await;
         Ok(())
     }
 
